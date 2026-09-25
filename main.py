@@ -47,6 +47,15 @@ def parse_side(text: str):
     return parse_expr(text, transformations=TRANSFORMS)
 
 
+def pretty(expr):
+    """Turn a sympy expression into display text without stray *'s, e.g. '54*x' -> '54x'."""
+    s = sp.sstr(expr)
+    s = re.sub(r"(\d)\*([a-zA-Z])", r"\1\2", s)   # 54*x -> 54x
+    s = re.sub(r"\b1([a-zA-Z])\b", r"\1", s)      # 1x -> x
+    s = s.replace("**2", "²").replace("**3", "³").replace("**", "^")
+    return s
+
+
 def fmt(n):
     """Pretty-print a sympy number: whole numbers without .0, fractions as a/b."""
     n = sp.nsimplify(n)
@@ -65,8 +74,8 @@ def solve_equation(problem: str):
     degree = poly.degree()
 
     steps = [{
-        "d": f"{sp.sstr(lhs)} = {sp.sstr(rhs)}",
-        "s": f"Let's solve {sp.sstr(lhs)} equals {sp.sstr(rhs)}, for x.",
+        "d": f"{pretty(lhs)} = {pretty(rhs)}",
+        "s": f"Let's solve {pretty(lhs)} equals {pretty(rhs)}, for x.",
     }]
 
     if degree == 1:
