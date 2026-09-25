@@ -144,6 +144,162 @@ def solve_arithmetic(problem: str):
     return steps
 
 
+def solve_percentage(problem: str):
+    low = problem.lower()
+
+    m = re.search(r"increase\s+(-?\d+\.?\d*)\s+by\s+(-?\d+\.?\d*)\s*%", low)
+    if m:
+        base, pct = sp.nsimplify(m.group(1)), sp.nsimplify(m.group(2))
+        change = base * pct / 100
+        result = base + change
+        return [
+            {"d": f"Increase {fmt(base)} by {fmt(pct)}%", "s": f"Let's increase {fmt(base)} by {fmt(pct)} percent."},
+            {"d": f"{fmt(pct)}% of {fmt(base)} = {fmt(base)} × {fmt(pct)}/100 = {fmt(change)}",
+             "s": f"First find {fmt(pct)} percent of {fmt(base)}, which is {fmt(change)}."},
+            {"d": f"{fmt(base)} + {fmt(change)} = {fmt(result)}",
+             "s": f"Add that to the original amount: {fmt(result)}."},
+            {"d": f"Answer: {fmt(result)}", "s": f"So the increased value is {fmt(result)}."},
+        ]
+
+    m = re.search(r"decrease\s+(-?\d+\.?\d*)\s+by\s+(-?\d+\.?\d*)\s*%", low)
+    if m:
+        base, pct = sp.nsimplify(m.group(1)), sp.nsimplify(m.group(2))
+        change = base * pct / 100
+        result = base - change
+        return [
+            {"d": f"Decrease {fmt(base)} by {fmt(pct)}%", "s": f"Let's decrease {fmt(base)} by {fmt(pct)} percent."},
+            {"d": f"{fmt(pct)}% of {fmt(base)} = {fmt(base)} × {fmt(pct)}/100 = {fmt(change)}",
+             "s": f"First find {fmt(pct)} percent of {fmt(base)}, which is {fmt(change)}."},
+            {"d": f"{fmt(base)} - {fmt(change)} = {fmt(result)}",
+             "s": f"Subtract that from the original amount: {fmt(result)}."},
+            {"d": f"Answer: {fmt(result)}", "s": f"So the decreased value is {fmt(result)}."},
+        ]
+
+    m = re.search(r"(-?\d+\.?\d*)\s*%\s*of\s*(-?\d+\.?\d*)", low)
+    if m:
+        pct, base = sp.nsimplify(m.group(1)), sp.nsimplify(m.group(2))
+        result = base * pct / 100
+        return [
+            {"d": f"{fmt(pct)}% of {fmt(base)} = ?", "s": f"Let's find {fmt(pct)} percent of {fmt(base)}."},
+            {"d": f"{fmt(pct)}% = {fmt(pct)}/100", "s": f"{fmt(pct)} percent means {fmt(pct)} over 100."},
+            {"d": f"{fmt(pct)}/100 × {fmt(base)} = {fmt(result)}",
+             "s": f"Multiply that by {fmt(base)} to get {fmt(result)}."},
+            {"d": f"Answer: {fmt(result)}", "s": f"So the answer is {fmt(result)}."},
+        ]
+
+    raise HTTPException(400, "Try a percentage problem like '20% of 150', "
+                              "'increase 150 by 20%', or 'decrease 150 by 20%'.")
+
+
+def num_after(keyword, text):
+    m = re.search(keyword + r"[^\d]{0,15}?(-?\d+\.?\d*)", text)
+    return sp.nsimplify(m.group(1)) if m else None
+
+
+def solve_geometry(problem: str):
+    low = problem.lower()
+    want_perimeter = "perimeter" in low or "circumference" in low
+    want_area = "area" in low or not want_perimeter
+
+    if "circle" in low:
+        r = num_after("radius", low)
+        if r is None:
+            raise HTTPException(400, "Give the radius, e.g. 'area of a circle with radius 7'.")
+        if want_perimeter:
+            result = 2 * sp.pi * r
+            return [
+                {"d": f"Circumference = 2πr, r = {fmt(r)}", "s": f"The circumference formula is 2 pi r, with radius {fmt(r)}."},
+                {"d": f"= 2 × π × {fmt(r)} = {fmt(result)}", "s": f"That works out to about {fmt(result)}."},
+            ]
+        result = sp.pi * r**2
+        return [
+            {"d": f"Area = πr², r = {fmt(r)}", "s": f"The area formula for a circle is pi r squared, with radius {fmt(r)}."},
+            {"d": f"= π × {fmt(r)}² = {fmt(result)}", "s": f"That comes to about {fmt(result)}."},
+        ]
+
+    if "rectangle" in low:
+        l = num_after("length", low)
+        w = num_after("width", low) or num_after("breadth", low)
+        if l is None or w is None:
+            raise HTTPException(400, "Give both length and width, e.g. 'area of a rectangle with length 8 and width 5'.")
+        if want_perimeter:
+            result = 2 * (l + w)
+            return [
+                {"d": f"Perimeter = 2(l + w), l={fmt(l)}, w={fmt(w)}", "s": f"The perimeter formula is 2 times length plus width."},
+                {"d": f"= 2({fmt(l)} + {fmt(w)}) = {fmt(result)}", "s": f"That gives {fmt(result)}."},
+            ]
+        result = l * w
+        return [
+            {"d": f"Area = l × w, l={fmt(l)}, w={fmt(w)}", "s": "The area formula is length times width."},
+            {"d": f"= {fmt(l)} × {fmt(w)} = {fmt(result)}", "s": f"That gives {fmt(result)}."},
+        ]
+
+    if "square" in low:
+        s = num_after("side", low)
+        if s is None:
+            raise HTTPException(400, "Give the side length, e.g. 'area of a square with side 6'.")
+        if want_perimeter:
+            result = 4 * s
+            return [
+                {"d": f"Perimeter = 4 × side = 4 × {fmt(s)}", "s": "The perimeter formula is four times the side."},
+                {"d": f"= {fmt(result)}", "s": f"That gives {fmt(result)}."},
+            ]
+        result = s * s
+        return [
+            {"d": f"Area = side² = {fmt(s)}²", "s": "The area formula is the side squared."},
+            {"d": f"= {fmt(result)}", "s": f"That gives {fmt(result)}."},
+        ]
+
+    if "triangle" in low:
+        b = num_after("base", low)
+        h = num_after("height", low)
+        if b is None or h is None:
+            raise HTTPException(400, "Give base and height, e.g. 'area of a triangle with base 10 and height 4'.")
+        result = sp.Rational(1, 2) * b * h
+        return [
+            {"d": f"Area = ½ × base × height, base={fmt(b)}, height={fmt(h)}",
+             "s": "The area formula is one half times base times height."},
+            {"d": f"= ½ × {fmt(b)} × {fmt(h)} = {fmt(result)}", "s": f"That gives {fmt(result)}."},
+        ]
+
+    raise HTTPException(400, "This solver currently handles circle, rectangle, square, and triangle "
+                              "area/perimeter problems.")
+
+
+def extract_calc_expr(problem: str):
+    text = re.sub(r"(?i)differentiate|derivative of|d/dx|integrate|with respect to x|\by\s*=", "", problem)
+    text = text.strip().strip("()")
+    return parse_side(text)
+
+
+def solve_derivative(problem: str):
+    expr = sp.expand(extract_calc_expr(problem))
+    terms = sp.Add.make_args(expr)
+    steps = [{"d": f"Differentiate: {pretty(expr)}",
+               "s": f"Let's differentiate {pretty(expr)}, with respect to x."}]
+    for term in terms:
+        d = sp.diff(term, X)
+        steps.append({"d": f"d/dx({pretty(term)}) = {pretty(d)}",
+                       "s": f"The derivative of {pretty(term)} is {pretty(d)}."})
+    total = sp.diff(expr, X)
+    steps.append({"d": f"dy/dx = {pretty(total)}", "s": f"Adding those, dy by dx equals {pretty(total)}."})
+    return steps
+
+
+def solve_integral(problem: str):
+    expr = sp.expand(extract_calc_expr(problem))
+    terms = sp.Add.make_args(expr)
+    steps = [{"d": f"Integrate: {pretty(expr)}",
+               "s": f"Let's integrate {pretty(expr)}, with respect to x."}]
+    for term in terms:
+        i = sp.integrate(term, X)
+        steps.append({"d": f"∫{pretty(term)} dx = {pretty(i)}",
+                       "s": f"The integral of {pretty(term)} is {pretty(i)}."})
+    total = sp.integrate(expr, X)
+    steps.append({"d": f"= {pretty(total)} + C", "s": "Adding those together, and remembering the constant of integration, C."})
+    return steps
+
+
 @app.get("/")
 def health():
     return {"status": "ok", "message": "SolveBoard solver is running."}
@@ -155,8 +311,22 @@ def solve(payload: ProblemIn):
     if not problem:
         raise HTTPException(400, "Please provide a problem.")
 
+    low = problem.lower()
     try:
-        if "=" in problem:
+        if "%" in problem:
+            steps = solve_percentage(problem)
+            topic = "Percentage"
+        elif any(w in low for w in ["area", "perimeter", "circumference"]) and \
+                any(w in low for w in ["circle", "rectangle", "square", "triangle"]):
+            steps = solve_geometry(problem)
+            topic = "Geometry"
+        elif re.search(r"(?i)differentiate|derivative|d/dx", problem):
+            steps = solve_derivative(problem)
+            topic = "Calculus (Differentiation)"
+        elif re.search(r"(?i)integrate|∫", problem):
+            steps = solve_integral(problem)
+            topic = "Calculus (Integration)"
+        elif "=" in problem:
             steps = solve_equation(problem)
             topic = "Equation"
         elif re.search(r"\d\s*/\s*\d.*[+\-].*\d\s*/\s*\d", problem):
@@ -168,8 +338,8 @@ def solve(payload: ProblemIn):
     except HTTPException:
         raise
     except Exception:
-        raise HTTPException(400, "Couldn't understand that problem — try a simpler equation "
-                                  "like '2x + 5 = 17', a fraction sum like '1/4 + 1/2', "
-                                  "or basic arithmetic like '6 * 4'.")
+        raise HTTPException(400, "Couldn't understand that problem — try things like "
+                                  "'2x + 5 = 17', '1/4 + 1/2', '20% of 150', "
+                                  "'area of a circle with radius 7', or 'differentiate x^2 + 3x'.")
 
     return {"topic": topic, "problem": problem, "steps": steps}
