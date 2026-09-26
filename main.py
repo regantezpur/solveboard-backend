@@ -50,16 +50,52 @@ SYMBOL_MAP = {
 }
 
 
+TRIG_POWER_RE = re.compile(r"\b(sin|cos|tan|sec|csc|cot)\^(\d+)\(([^()]*)\)", re.IGNORECASE)
+
+
 def normalize(text: str) -> str:
     """Turn symbols from the on-screen math toolbar into parseable text."""
     for k, v in SYMBOL_MAP.items():
         text = text.replace(k, v)
+    # tan^2(30) -> (tan(30))^2, so the power applies to the whole function result
+    text = TRIG_POWER_RE.sub(r"(\1(\3))^\2", text)
     return text
 
 
-def parse_side(text: str):
+def strip_outer_parens(s: str) -> str:
+    """Remove a genuinely wrapping pair of parens, e.g. '(x+1)' -> 'x+1',
+    WITHOUT touching a function call's own parens like 'sin(x)'."""
+    s = s.strip()
+    if s.startswith("(") and s.endswith(")"):
+        depth = 0
+        for i, ch in enumerate(s):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            if depth == 0 and i < len(s) - 1:
+                return s  # closes before the very end -> not a full outer wrap
+        return s[1:-1]
+    return s
+
+
+def apply_degrees(expr):
+    """K-12 trig problems give angles in degrees (e.g. tan(30)), but SymPy's
+    sin/cos/tan assume radians. Convert any trig call whose argument is a plain
+    number (not a symbolic variable like x) so the numbers come out correct."""
+    for fn in (sp.sin, sp.cos, sp.tan, sp.sec, sp.csc, sp.cot):
+        expr = expr.replace(
+            lambda e, fn=fn: e.func == fn and e.args[0].is_number,
+            lambda e, fn=fn: fn(e.args[0] * sp.pi / 180),
+        )
+    return expr
+
+
+def parse_side(text: str, degrees: bool = True):
     text = normalize(text).replace("^", "**")
-    return parse_expr(text, transformations=TRANSFORMS)
+    text = text.lower()  # unify variable case (x vs X) and function names
+    expr = parse_expr(text, transformations=TRANSFORMS)
+    return apply_degrees(expr) if degrees else expr
 
 
 def pretty(expr):
@@ -233,13 +269,65 @@ def solve_fraction_add(problem: str):
     return steps
 
 
+def _infix_display(node, arg_vals):
+    """Render one node's operation (pre-evaluation) for display, e.g. '2 × 3', '6 + 32'."""
+    if node.func == sp.Add:
+        parts = [term_str(v, first=(i == 0)) for i, v in enumerate(arg_vals)]
+        return " ".join(parts)
+    if node.func == sp.Mul:
+        return " × ".join(fmt(v) for v in arg_vals)
+    if node.func == sp.Pow:
+        if arg_vals[1] == sp.Rational(1, 2):
+            return f"√{fmt(arg_vals[0])}"
+        return f"{fmt(arg_vals[0])}^{fmt(arg_vals[1])}"
+    if node.func in (sp.sin, sp.cos, sp.tan, sp.sec, sp.csc, sp.cot):
+        # arg_vals[0] is already in radians (converted); show the original degree number
+        deg = sp.nsimplify(arg_vals[0] * 180 / sp.pi)
+        return f"{node.func.__name__}({fmt(deg)}°)"
+    if node.func == sp.log:
+        return f"log({fmt(arg_vals[0])})"
+    return pretty(node.func(*arg_vals))
+
+
+def _arithmetic_steps(expr):
+    """Walk the expression bottom-up (post-order), emitting one step per
+    operation as it becomes fully numeric — this naturally follows BODMAS/PEMDAS
+    order since inner sub-expressions are always resolved before outer ones."""
+    steps = []
+
+    def rec(node):
+        if node.is_Atom:
+            return node
+        arg_vals = [rec(a) for a in node.args]
+        if all(v.is_number for v in arg_vals):
+            disp = _infix_display(node, arg_vals)
+            evaluated = node.func(*arg_vals)
+            val = sp.nsimplify(evaluated)
+            if not (val.is_Integer or val.is_Rational):
+                val = sp.nsimplify(evaluated.evalf(6), rational=False)
+            steps.append({"d": f"{disp} = {fmt(val)}", "s": f"{disp} equals {fmt(val)}."})
+            return val
+        return node.func(*arg_vals)
+
+    result = rec(expr)
+    return steps, result
+
+
 def solve_arithmetic(problem: str):
-    expr = parse_side(problem)
-    result = sp.nsimplify(expr)
-    steps = [
-        {"d": f"{problem.strip()} = ?", "s": f"Let's work out {problem.strip()}."},
-        {"d": f"{problem.strip()} = {fmt(result)}", "s": f"That comes to {fmt(result)}."},
-    ]
+    raw = problem.strip()
+    expr = parse_side(raw, degrees=True)
+    # Parse again, unevaluated, so we can walk the original structure step by step —
+    # SymPy auto-simplifies plain numeric expressions the instant they're built otherwise.
+    unevaluated = parse_expr(
+        normalize(raw).replace("^", "**").lower(), transformations=TRANSFORMS, evaluate=False
+    )
+    unevaluated = apply_degrees(unevaluated)
+
+    steps = [{"d": f"{raw} = ?", "s": f"Let's work this out, following the order of operations."}]
+    sub_steps, result = _arithmetic_steps(unevaluated)
+    steps.extend(sub_steps)
+    if len(sub_steps) != 1:
+        steps.append({"d": f"{raw} = {fmt(result)}", "s": f"So altogether, that's {fmt(result)}."})
     return steps
 
 
@@ -367,8 +455,10 @@ def solve_geometry(problem: str):
 
 def extract_calc_expr(problem: str):
     text = re.sub(r"(?i)differentiate|derivative of|d/dx|integrate|with respect to x|\by\s*=", "", problem)
-    text = text.strip().strip("()")
-    return parse_side(text)
+    text = strip_outer_parens(text.strip())
+    # Calculus is done symbolically in x, in radians (the standard convention) —
+    # degree-conversion is only for evaluating a specific numeric angle.
+    return parse_side(text, degrees=False)
 
 
 def solve_derivative(problem: str):
