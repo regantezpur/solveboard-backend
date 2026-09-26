@@ -42,8 +42,23 @@ class ProblemIn(BaseModel):
     problem: str
 
 
+SYMBOL_MAP = {
+    "√": "sqrt", "π": "pi", "×": "*", "÷": "/", "−": "-", "·": "*",
+    "≤": "<=", "≥": ">=", "≠": "!=",
+    "⁰": "^0", "¹": "^1", "²": "^2", "³": "^3", "⁴": "^4",
+    "⁵": "^5", "⁶": "^6", "⁷": "^7", "⁸": "^8", "⁹": "^9",
+}
+
+
+def normalize(text: str) -> str:
+    """Turn symbols from the on-screen math toolbar into parseable text."""
+    for k, v in SYMBOL_MAP.items():
+        text = text.replace(k, v)
+    return text
+
+
 def parse_side(text: str):
-    text = text.replace("^", "**")
+    text = normalize(text).replace("^", "**")
     return parse_expr(text, transformations=TRANSFORMS)
 
 
@@ -66,50 +81,134 @@ def fmt(n):
     return str(sp.nsimplify(n, rational=False).evalf(4))
 
 
+def term_str(coeff, var="", first=False):
+    """Format one polynomial term with correct sign and no '1x'/'​-1x' clutter."""
+    coeff = sp.nsimplify(coeff)
+    sign = "" if (first and coeff >= 0) else ("+ " if coeff >= 0 else "- ")
+    mag = abs(coeff)
+    if var and mag == 1:
+        body = var
+    else:
+        body = f"{fmt(mag)}{var}"
+    return f"{sign}{body}"
+
+
+def poly_str(a, b, c):
+    return f"{term_str(a, 'x²', first=True)} {term_str(b, 'x')} {term_str(c)}"
+
+
+def _find_split_pair(ac, b):
+    """For factoring by splitting the middle term: find integers p,q with p*q=ac, p+q=b."""
+    ac = int(ac)
+    if ac == 0:
+        return None
+    for i in range(1, abs(ac) + 1):
+        if ac % i:
+            continue
+        j = ac // i
+        for p, q in ((i, j), (-i, -j), (i, -j), (-i, j)):
+            if p + q == b:
+                return p, q
+    return None
+
+
+def solve_linear(given_lhs, given_rhs, lhs, rhs, a, b):
+    """Standard sequence: given -> transpose -> isolate -> solve -> verify."""
+    steps = [{"d": f"Given:  {given_lhs} = {given_rhs}",
+               "s": f"We're given the equation {pretty(lhs)} equals {pretty(rhs)}. Let's solve for x."}]
+
+    steps.append({"d": f"Transposing the constant term:  {fmt(a)}x = {fmt(-b)}",
+                   "s": "Move the constant term to the other side of the equation, "
+                        "changing its sign — this is called transposing."})
+
+    root = sp.nsimplify(-b / a)
+    if a != 1:
+        steps.append({"d": f"Dividing both sides by {fmt(a)}:  x = {fmt(-b)} / {fmt(a)}",
+                       "s": f"Divide both sides by {fmt(a)} to isolate x."})
+
+    steps.append({"d": f"x = {fmt(root)}", "s": f"So x equals {fmt(root)}."})
+
+    lhs_check = sp.nsimplify(lhs.subs(X, root))
+    rhs_check = sp.nsimplify(rhs.subs(X, root))
+    steps.append({"d": f"Check:  substitute x = {fmt(root)} back in",
+                   "s": "Let's verify the answer by substituting it back into the original equation."})
+    steps.append({"d": f"{pretty(lhs)} → {fmt(lhs_check)}   and   {pretty(rhs)} → {fmt(rhs_check)}  ✓",
+                   "s": "Both sides come out equal, so the solution checks out."})
+    return steps
+
+
+def solve_quadratic(given_lhs, given_rhs, lhs, rhs, a, b, c, expr):
+    steps = [{"d": f"Given:  {given_lhs} = {given_rhs}",
+               "s": f"We're given {pretty(lhs)} equals {pretty(rhs)}. Let's solve for x."}]
+    steps.append({"d": f"Standard form:  {poly_str(a, b, c)} = 0",
+                   "s": "Rewrite it in standard quadratic form, a x squared plus b x plus c equals zero."})
+    steps.append({"d": f"a = {fmt(a)},  b = {fmt(b)},  c = {fmt(c)}",
+                   "s": f"Comparing with the standard form: a is {fmt(a)}, b is {fmt(b)}, c is {fmt(c)}."})
+
+    disc = sp.simplify(b**2 - 4*a*c)
+    is_int_coeffs = all(v.is_Integer for v in (a, b, c))
+    pair = _find_split_pair(a * c, b) if is_int_coeffs else None
+
+    if pair:
+        p, q = pair
+        steps.append({"d": "Method: factoring by splitting the middle term",
+                       "s": "Since this factors neatly, let's use the splitting-the-middle-term method."})
+        steps.append({"d": f"Find two numbers with product a×c = {fmt(a*c)} and sum b = {fmt(b)}",
+                       "s": f"We need two numbers whose product is {fmt(a*c)} and whose sum is {fmt(b)}."})
+        steps.append({"d": f"Those numbers are {fmt(p)} and {fmt(q)}",
+                       "s": f"Those numbers are {fmt(p)} and {fmt(q)}."})
+        split_line = f"{term_str(a, 'x²', first=True)} {term_str(p, 'x')} {term_str(q, 'x')} {term_str(c)}"
+        steps.append({"d": f"Split the middle term:  {split_line} = 0",
+                       "s": "Split the middle term into these two parts."})
+        factored = sp.factor(expr)
+        steps.append({"d": f"Factor by grouping:  {pretty(factored)} = 0",
+                       "s": "Group the terms in pairs and factor each pair, then factor out the common bracket."})
+        roots = sorted(sp.solve(sp.Eq(expr, 0), X), key=lambda r: sp.N(r))
+        r1 = roots[0]
+        r2 = roots[1] if len(roots) > 1 else roots[0]
+        steps.append({"d": "Set each factor to zero", "s": "Each factor, set equal to zero, gives a solution."})
+    else:
+        steps.append({"d": "Method: the quadratic formula",
+                       "s": "This doesn't factor neatly with whole numbers, so let's use the quadratic formula."})
+        steps.append({"d": f"Discriminant D = b² - 4ac = {fmt(b)}² - 4({fmt(a)})({fmt(c)}) = {fmt(disc)}",
+                       "s": f"The discriminant works out to {fmt(disc)}."})
+        if disc < 0:
+            steps.append({"d": "D < 0  →  no real solutions",
+                           "s": "Since the discriminant is negative, there are no real solutions."})
+            return steps
+        steps.append({"d": f"x = (-b ± √D) / (2a) = (-{fmt(b)} ± √{fmt(disc)}) / (2×{fmt(a)})",
+                       "s": "Substitute the values into the quadratic formula."})
+        roots = sorted(sp.solve(sp.Eq(expr, 0), X), key=lambda r: sp.N(r))
+        r1 = roots[0]
+        r2 = roots[1] if len(roots) > 1 else roots[0]
+
+    if r1 == r2:
+        steps.append({"d": f"x = {fmt(r1)}  (repeated root)", "s": f"So x equals {fmt(r1)}, a repeated root."})
+    else:
+        steps.append({"d": f"x = {fmt(r1)}   or   x = {fmt(r2)}",
+                       "s": f"So x equals {fmt(r1)}, or x equals {fmt(r2)}."})
+    return steps
+
+
 def solve_equation(problem: str):
     lhs_text, rhs_text = problem.split("=")
+    def display_form(t):
+        t = normalize(t).strip()
+        return t.replace("^2", "²").replace("^3", "³")
+
+    given_lhs = display_form(lhs_text)
+    given_rhs = display_form(rhs_text)
     lhs, rhs = parse_side(lhs_text), parse_side(rhs_text)
     expr = sp.expand(lhs - rhs)
     poly = sp.Poly(expr, X)
     degree = poly.degree()
 
-    steps = [{
-        "d": f"{pretty(lhs)} = {pretty(rhs)}",
-        "s": f"Let's solve {pretty(lhs)} equals {pretty(rhs)}, for x.",
-    }]
-
     if degree == 1:
-        a, b = poly.all_coeffs()  # a*x + b = 0
-        steps.append({"d": f"{fmt(a)}x = {fmt(-b)}",
-                       "s": "Move the constant term to the other side."})
-        root = sp.nsimplify(-b / a)
-        steps.append({"d": f"x = {fmt(-b)} / {fmt(a)}",
-                       "s": f"Divide both sides by {fmt(a)}."})
-        steps.append({"d": f"x = {fmt(root)}",
-                       "s": f"So x equals {fmt(root)}."})
-        return steps
-
+        a, b = poly.all_coeffs()
+        return solve_linear(given_lhs, given_rhs, lhs, rhs, a, b)
     if degree == 2:
         a, b, c = poly.all_coeffs()
-        steps.append({"d": f"{fmt(a)}x² + {fmt(b)}x + {fmt(c)} = 0",
-                       "s": "Rewrite it in standard quadratic form."})
-        disc = sp.simplify(b**2 - 4*a*c)
-        steps.append({"d": f"Discriminant = {fmt(b)}² - 4({fmt(a)})({fmt(c)}) = {fmt(disc)}",
-                       "s": f"The discriminant works out to {fmt(disc)}."})
-        if disc < 0:
-            steps.append({"d": "No real solutions",
-                           "s": "Since the discriminant is negative, there are no real solutions."})
-            return steps
-        roots = sorted(sp.solve(sp.Eq(expr, 0), X), key=lambda r: sp.N(r))
-        r1, r2 = roots[0], roots[1] if len(roots) > 1 else roots[0]
-        steps.append({"d": f"x = (-{fmt(b)} ± √{fmt(disc)}) / (2·{fmt(a)})",
-                       "s": "Apply the quadratic formula."})
-        if r1 == r2:
-            steps.append({"d": f"x = {fmt(r1)}", "s": f"So x equals {fmt(r1)}."})
-        else:
-            steps.append({"d": f"x = {fmt(r1)}  or  x = {fmt(r2)}",
-                           "s": f"So x equals {fmt(r1)}, or x equals {fmt(r2)}."})
-        return steps
+        return solve_quadratic(given_lhs, given_rhs, lhs, rhs, a, b, c, expr)
 
     raise HTTPException(400, "This solver currently handles linear and quadratic equations only.")
 
