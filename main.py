@@ -114,12 +114,36 @@ def parse_side(text: str, degrees: bool = True):
     return apply_degrees(expr) if degrees else expr
 
 
+def sqrtify(s: str) -> str:
+    """Convert sqrt(...) to √(...), correctly handling nested sqrt(sqrt(...)) —
+    a plain regex can't do this because it can't match balanced/nested parens."""
+    out = []
+    i = 0
+    while i < len(s):
+        if s[i:i + 5] == "sqrt(":
+            depth = 1
+            j = i + 5
+            while j < len(s) and depth > 0:
+                if s[j] == "(":
+                    depth += 1
+                elif s[j] == ")":
+                    depth -= 1
+                j += 1
+            out.append(f"√({sqrtify(s[i + 5:j - 1])})")
+            i = j
+        else:
+            out.append(s[i])
+            i += 1
+    return "".join(out)
+
+
 def pretty(expr):
     """Turn a sympy expression into display text without stray *'s, e.g. '54*x' -> '54x'."""
     s = sp.sstr(expr)
     s = re.sub(r"(\d)\*([a-zA-Z])", r"\1\2", s)   # 54*x -> 54x
     s = re.sub(r"\b1([a-zA-Z])\b", r"\1", s)      # 1x -> x
     s = s.replace("**2", "²").replace("**3", "³").replace("**", "^")
+    s = sqrtify(s)
     return s
 
 
@@ -477,17 +501,92 @@ def extract_calc_expr(problem: str):
     return parse_side(text, degrees=False)
 
 
+TRIG_DERIVS = {
+    sp.sin: lambda u: sp.cos(u),
+    sp.cos: lambda u: -sp.sin(u),
+    sp.tan: lambda u: sp.sec(u) ** 2,
+}
+
+
+def diff_with_steps(expr, steps, top=True):
+    """Differentiate expr wrt X, appending a human-readable chain/product-rule step
+    for every composite (non-trivial) operation encountered. Simple monomials like
+    x**2 or 3*x are resolved silently, exactly as before, to avoid noisy over-explaining."""
+    if not expr.has(X):
+        return sp.Integer(0)
+    if expr == X:
+        return sp.Integer(1)
+
+    if isinstance(expr, sp.Add):
+        return sp.Add(*[diff_with_steps(a, steps, top=False) for a in expr.args])
+
+    if isinstance(expr, sp.Mul):
+        const_factors = [a for a in expr.args if not a.has(X)]
+        var_parts = [a for a in expr.args if a.has(X)]
+        const_part = sp.Mul(*const_factors) if const_factors else sp.Integer(1)
+        if len(var_parts) <= 1:
+            u = var_parts[0] if var_parts else sp.Integer(1)
+            return const_part * diff_with_steps(u, steps, top=False)
+        # product rule across all variable factors, applied pairwise
+        u = var_parts[0]
+        v = sp.Mul(*var_parts[1:])
+        steps.append({"d": f"Product rule:  d/dx({pretty(u)}·{pretty(v)}) = {pretty(u)}·d/dx({pretty(v)}) + {pretty(v)}·d/dx({pretty(u)})",
+                       "s": "Since this is a product of two expressions involving x, use the product rule."})
+        du = diff_with_steps(u, steps, top=False)
+        dv = diff_with_steps(v, steps, top=False)
+        return const_part * sp.simplify(u * dv + v * du)
+
+    if isinstance(expr, sp.Pow):
+        base, exp = expr.args
+        if exp.has(X):
+            return sp.diff(expr, X)  # variable exponent — outside current scope, fall back silently
+        if base == X:
+            return exp * X ** (exp - 1)
+        if exp == sp.Rational(1, 2):
+            steps.append({"d": f"d/dx(√({pretty(base)})) = 1/(2√({pretty(base)})) · d/dx({pretty(base)})",
+                           "s": f"This is a square root of an expression involving x, so use the chain rule: "
+                                f"one over twice the square root of the inside, times the derivative of the inside."})
+        else:
+            steps.append({"d": f"d/dx(({pretty(base)})^{fmt(exp)}) = {fmt(exp)}({pretty(base)})^{fmt(exp - 1)} · d/dx({pretty(base)})",
+                           "s": f"Use the chain rule: bring down the exponent {fmt(exp)}, reduce the power by one, "
+                                f"and multiply by the derivative of the inside."})
+        inner_deriv = diff_with_steps(base, steps, top=False)
+        if base != X:
+            steps.append({"d": f"d/dx({pretty(base)}) = {pretty(inner_deriv)}",
+                           "s": f"The derivative of the inside, {pretty(base)}, is {pretty(inner_deriv)}."})
+        if exp == sp.Rational(1, 2):
+            return sp.simplify(inner_deriv / (2 * sp.sqrt(base)))
+        return sp.simplify(exp * base ** (exp - 1) * inner_deriv)
+
+    if expr.func in TRIG_DERIVS:
+        inner = expr.args[0]
+        outer_deriv = TRIG_DERIVS[expr.func](inner)
+        steps.append({"d": f"d/dx({expr.func.__name__}({pretty(inner)})) = {pretty(outer_deriv)} · d/dx({pretty(inner)})",
+                       "s": f"Use the chain rule for {expr.func.__name__}: differentiate the outside, "
+                            f"then multiply by the derivative of the inside."})
+        inner_deriv = diff_with_steps(inner, steps, top=False)
+        if inner != X:
+            steps.append({"d": f"d/dx({pretty(inner)}) = {pretty(inner_deriv)}",
+                           "s": f"The derivative of the inside, {pretty(inner)}, is {pretty(inner_deriv)}."})
+        return sp.simplify(outer_deriv * inner_deriv)
+
+    return sp.diff(expr, X)  # fallback for anything not explicitly handled above
+
+
 def solve_derivative(problem: str):
     expr = sp.expand(extract_calc_expr(problem))
-    terms = sp.Add.make_args(expr)
+    is_simple = expr.is_polynomial(X)
+    terms = sp.Add.make_args(expr) if is_simple else [expr]
+
     steps = [{"d": f"Differentiate: {pretty(expr)}",
                "s": f"Let's differentiate {pretty(expr)}, with respect to x."}]
     for term in terms:
-        d = sp.diff(term, X)
-        steps.append({"d": f"d/dx({pretty(term)}) = {pretty(d)}",
-                       "s": f"The derivative of {pretty(term)} is {pretty(d)}."})
-    total = sp.diff(expr, X)
-    steps.append({"d": f"dy/dx = {pretty(total)}", "s": f"Adding those, dy by dx equals {pretty(total)}."})
+        d = diff_with_steps(term, steps)
+        if is_simple:
+            steps.append({"d": f"d/dx({pretty(term)}) = {pretty(d)}",
+                           "s": f"The derivative of {pretty(term)} is {pretty(d)}."})
+    total = sp.simplify(sp.diff(expr, X))
+    steps.append({"d": f"dy/dx = {pretty(total)}", "s": f"So dy by dx equals {pretty(total)}."})
     return steps
 
 
