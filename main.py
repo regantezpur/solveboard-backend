@@ -50,15 +50,31 @@ SYMBOL_MAP = {
 }
 
 
-TRIG_POWER_RE = re.compile(r"\b(sin|cos|tan|sec|csc|cot)\^(\d+)\(([^()]*)\)", re.IGNORECASE)
+FUNC_NAMES = "sin|cos|tan|sec|csc|cot|sqrt|log|ln"
+# func^n(arg) or func^narg  ->  (func(arg))^n   e.g. tan^2(30), sin^2x
+ARG = r"(?:\d+|x|pi|π)"  # the only bare arguments we accept — deliberately NOT a general word
+# Two separate, unambiguous patterns rather than one with an optional paren on both ends —
+# an optional-paren-plus-trailing-\b regex can match without consuming the closing paren,
+# leaving it stranded in the output (a real bug this shipped with once: 'tan^2(30)' -> '(tan(30))^2)').
+FUNC_POWER_PAREN_RE = re.compile(rf"(?<![a-zA-Z])({FUNC_NAMES})\^(\d+)\(({ARG})\)", re.IGNORECASE)
+FUNC_POWER_BARE_RE = re.compile(rf"(?<![a-zA-Z])({FUNC_NAMES})\^(\d+)({ARG})\b(?!\()", re.IGNORECASE)
+# bare func name with no parens at all, e.g. sinx, sinpi, cos30, 2sinx  ->  func(arg)
+# (?<![a-zA-Z]) lets a digit precede it (2sinx) but not a letter (avoids matching inside "using")
+# (?!\() skips names already followed by '(' — those are already fine
+# The whitelist ARG (digits/x/pi only, not any letters) is what keeps this from mangling
+# ordinary words like "cost" or "cosine" that happen to start with a function name.
+BARE_FUNC_RE = re.compile(rf"(?<![a-zA-Z])({FUNC_NAMES})(?!\()({ARG})\b", re.IGNORECASE)
 
 
 def normalize(text: str) -> str:
-    """Turn symbols from the on-screen math toolbar into parseable text."""
+    """Turn symbols from the on-screen math toolbar into parseable text, and rescue
+    function calls a student typed without parentheses (e.g. 'sinx', 'sinpi') before
+    the parser can misread them as separate letters multiplied together."""
     for k, v in SYMBOL_MAP.items():
         text = text.replace(k, v)
-    # tan^2(30) -> (tan(30))^2, so the power applies to the whole function result
-    text = TRIG_POWER_RE.sub(r"(\1(\3))^\2", text)
+    text = FUNC_POWER_PAREN_RE.sub(r"(\1(\3))^\2", text)
+    text = FUNC_POWER_BARE_RE.sub(r"(\1(\3))^\2", text)
+    text = BARE_FUNC_RE.sub(r"\1(\2)", text)
     return text
 
 
@@ -489,6 +505,139 @@ def solve_integral(problem: str):
     return steps
 
 
+def solve_complex(problem: str):
+    text = normalize(problem).replace("^", "**").lower()
+    expr = parse_expr(text, transformations=TRANSFORMS, local_dict={"i": sp.I})
+
+    steps = [{"d": f"{problem.strip()}", "s": f"Let's simplify {problem.strip()}, where i is the imaginary unit."}]
+
+    def ipretty(e):
+        return pretty(e).replace("I", "i")
+
+    combined = sp.together(expr)
+    num, den = sp.fraction(combined)
+    num_exp, den_exp = sp.expand(num), sp.expand(den)
+    if den != 1:
+        steps.append({"d": f"Combine into a single fraction:  ({ipretty(num)}) / ({ipretty(den)})",
+                       "s": "Combine everything into a single fraction, multiplying by conjugates where needed."})
+        steps.append({"d": f"Numerator = {ipretty(num_exp)}   Denominator = {ipretty(den_exp)}",
+                       "s": "Expand the numerator and denominator."})
+
+    result = sp.simplify(expr)
+    result = sp.nsimplify(result)
+    re_part = sp.nsimplify(sp.re(result))
+    im_part = sp.nsimplify(sp.im(result))
+    steps.append({"d": "Using i² = -1, simplify",
+                   "s": "Remember that i squared equals negative one, and simplify."})
+    if im_part == 0:
+        steps.append({"d": f"= {fmt(re_part)}", "s": f"That simplifies to {fmt(re_part)}."})
+        steps.append({"d": f"∴  a = {fmt(re_part)}  and  b = 0",
+                       "s": f"So in the form a plus b i, a is {fmt(re_part)} and b is 0."})
+    else:
+        im_str = f"{fmt(im_part)}i" if im_part != 1 else "i"
+        if im_part == -1:
+            im_str = "i"
+        sign = "+" if im_part >= 0 else "-"
+        steps.append({"d": f"= {fmt(re_part)} {sign} {fmt(abs(im_part))}i",
+                       "s": f"That simplifies to {fmt(re_part)} {'plus' if im_part>=0 else 'minus'} {fmt(abs(im_part))} i."})
+        steps.append({"d": f"∴  a = {fmt(re_part)}  and  b = {fmt(im_part)}",
+                       "s": f"So a is {fmt(re_part)} and b is {fmt(im_part)}."})
+    return steps
+
+
+def parse_vector(text):
+    """Extract (i, j, k) coefficients from free-form vector notation like 'i - 2j'."""
+    comps = []
+    for letter in ("i", "j", "k"):
+        m = re.search(rf"([+-]?\s*\d*\.?\d*)\s*{letter}\b", text)
+        if m and m.group(0).strip():
+            coeff_str = m.group(1).replace(" ", "")
+            if coeff_str in ("", "+"):
+                coeff = sp.Integer(1)
+            elif coeff_str == "-":
+                coeff = sp.Integer(-1)
+            else:
+                coeff = sp.nsimplify(coeff_str)
+            comps.append(coeff)
+        else:
+            comps.append(sp.Integer(0))
+    return comps
+
+
+def sqrt_str(n):
+    """Exact display of a square root — '5' -> '√5', '9' -> '3' (kept exact, never decimalized)."""
+    n = sp.nsimplify(n)
+    r = sp.sqrt(n)
+    if r.is_Integer or r.is_Rational:
+        return fmt(r)
+    return f"√{fmt(n)}"
+
+
+def sq_term(c):
+    """'(-2)²' for negatives, '3²' for positives — avoids the ugly '-2²'."""
+    return f"({fmt(c)})²" if c < 0 else f"{fmt(c)}²"
+
+
+def vector_str(ci, cj, ck, denom_display=None):
+    parts = []
+    labels = ("î", "ĵ", "k̂")
+    for c, lab in zip((ci, cj, ck), labels):
+        if c == 0:
+            continue
+        parts.append(term_str(c, lab, first=(len(parts) == 0)))
+    body = " ".join(parts) if parts else "0"
+    if denom_display is not None:
+        return f"({body}) / {denom_display}"
+    return body
+
+
+def solve_vector(problem: str):
+    low = problem.lower()
+    vec_text = problem[low.rfind(" of ") + 4:] if " of " in low else problem
+    ci, cj, ck = parse_vector(vec_text)
+
+    steps = [{"d": f"a = {vector_str(ci, cj, ck)}", "s": f"We're given the vector a equals {vector_str(ci, cj, ck)}."}]
+
+    mag_sq = ci**2 + cj**2 + ck**2
+    mag_display = sqrt_str(mag_sq)
+    sq_terms = " + ".join(sq_term(c) for c in (ci, cj, ck) if c != 0)
+    sqrt_disp = f"√{fmt(mag_sq)}"
+    mid = f"= {sqrt_disp} = {mag_display}" if mag_display != sqrt_disp else f"= {mag_display}"
+    steps.append({"d": f"|a| = √({sq_terms}) {mid}",
+                   "s": f"The magnitude is the square root of the sum of the squares of the components, which is {mag_display}."})
+
+    if "unit" in low or "direction" in low or "magnitude" in low:
+        steps.append({"d": f"â = a / |a| = {vector_str(ci, cj, ck, denom_display=mag_display)}",
+                       "s": "The unit vector in that direction is a divided by its magnitude."})
+
+    m = re.search(r"magnitude\s+of\s+(\d+\.?\d*)|magnitude\s+(\d+\.?\d*)", low)
+    if m and "direction" in low:
+        target = sp.nsimplify(m.group(1) or m.group(2))
+        steps.append({"d": f"Vector of magnitude {fmt(target)} = {fmt(target)} × â = {vector_str(target*ci, target*cj, target*ck, denom_display=mag_display)}",
+                       "s": f"A vector of magnitude {fmt(target)} in that direction is {fmt(target)} times the unit vector."})
+        mag_is_exact_int = sp.sqrt(mag_sq).is_Integer
+        pieces = []
+        for c, lab in zip((ci, cj, ck), ("î", "ĵ", "k̂")):
+            if c == 0:
+                continue
+            coeff = target * c
+            if mag_is_exact_int:
+                coeff = sp.nsimplify(coeff / sp.sqrt(mag_sq))
+                mag_frag = fmt(coeff)
+            else:
+                mag_frag = f"{fmt(abs(coeff))}/{mag_display}"
+                mag_frag = f"-{mag_frag}" if coeff < 0 else mag_frag
+            pieces.append((coeff, f"{mag_frag} {lab}"))
+        disp_terms = []
+        for i, (coeff, frag) in enumerate(pieces):
+            if i == 0:
+                disp_terms.append(frag)
+            else:
+                disp_terms.append(f"+ {frag}" if coeff >= 0 else f"- {frag.lstrip('-')}")
+        steps.append({"d": f"= {' '.join(disp_terms)}", "s": "That's the final vector, in exact form."})
+    return steps
+
+
 @app.get("/")
 def health():
     return {"status": "ok", "message": "SolveBoard solver is running."}
@@ -502,7 +651,15 @@ def solve(payload: ProblemIn):
 
     low = problem.lower()
     try:
-        if "%" in problem:
+        if re.search(r"(?<![a-zA-Z])i(?![a-zA-Z])", problem) and re.search(r"\d", problem) and \
+                ("/" in problem or "+" in problem or "-" in problem) and "sin" not in low and "cos" not in low:
+            steps = solve_complex(problem)
+            topic = "Complex Numbers"
+        elif re.search(r"(?<![a-zA-Z])[ijk](?![a-zA-Z])", problem) and \
+                any(w in low for w in ["vector", "magnitude", "direction", "unit"]):
+            steps = solve_vector(problem)
+            topic = "Vectors"
+        elif "%" in problem:
             steps = solve_percentage(problem)
             topic = "Percentage"
         elif any(w in low for w in ["area", "perimeter", "circumference"]) and \
