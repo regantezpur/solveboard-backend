@@ -606,36 +606,69 @@ def solve_integral(problem: str):
 
 def solve_complex(problem: str):
     text = normalize(problem).replace("^", "**").lower()
-    expr = parse_expr(text, transformations=TRANSFORMS, local_dict={"i": sp.I})
+    I = sp.Symbol("i")  # a PLAIN symbol, not sp.I — this is what lets us control exactly
+    # when i**2 becomes -1, instead of the math library doing it automatically and
+    # collapsing several teaching steps into one.
+    expr = parse_expr(text, transformations=TRANSFORMS, local_dict={"i": I})
 
-    steps = [{"d": f"{problem.strip()}", "s": f"Let's simplify {problem.strip()}, where i is the imaginary unit."}]
+    steps = [{"d": f"{problem.strip()}", "s": f"Let's simplify this, where i is the imaginary unit."}]
 
-    def ipretty(e):
-        return pretty(e).replace("I", "i")
+    add_args = sp.Add.make_args(expr)
+    num_expr, den_expr = None, None
 
-    combined = sp.together(expr)
-    num, den = sp.fraction(combined)
-    num_exp, den_exp = sp.expand(num), sp.expand(den)
-    if den != 1:
-        steps.append({"d": f"Combine into a single fraction:  ({ipretty(num)}) / ({ipretty(den)})",
-                       "s": "Combine everything into a single fraction, multiplying by conjugates where needed."})
-        steps.append({"d": f"Numerator = {ipretty(num_exp)}   Denominator = {ipretty(den_exp)}",
-                       "s": "Expand the numerator and denominator."})
+    if len(add_args) == 2 and all(sp.fraction(a)[1] != 1 for a in add_args):
+        # Exactly two fractions being added — do the textbook cross-multiplication method
+        (numA, denB), (numC, denD) = (sp.fraction(a) for a in add_args)
+        steps.append({"d": f"Combine using conjugates:  [({pretty(numA)})({pretty(denD)}) + ({pretty(denB)})({pretty(numC)})] / [({pretty(denB)})({pretty(denD)})]",
+                       "s": "Combine into a single fraction by cross-multiplying."})
+        num_expr = sp.expand(numA * denD + denB * numC)
+        den_expr = sp.expand(denB * denD)
+        steps.append({"d": f"Expand:  [{pretty(num_expr)}] / [{pretty(den_expr)}]",
+                       "s": "Expand each product."})
+    else:
+        combined = sp.together(expr)
+        num_expr, den_expr = sp.fraction(combined)
+        if den_expr.has(I):
+            # Rationalize: multiply top and bottom by the denominator's conjugate.
+            # (Substituting i -> -i gives the conjugate for anything linear in i.)
+            den_conj = den_expr.subs(I, -I)
+            steps.append({"d": f"Multiply numerator and denominator by the conjugate:  ({den_conj})/({den_conj})",
+                           "s": "Multiply both the numerator and denominator by the denominator's conjugate, to clear i from the denominator."})
+            num_expr = sp.expand(num_expr * den_conj)
+            den_expr = sp.expand(den_expr * den_conj)
+            steps.append({"d": f"= [{pretty(num_expr)}] / [{pretty(den_expr)}]",
+                           "s": "Expand the numerator and denominator."})
+        else:
+            num_expr, den_expr = sp.expand(num_expr), sp.expand(den_expr)
+            if den_expr != 1:
+                steps.append({"d": f"Combine into a single fraction:  [{pretty(num_expr)}] / [{pretty(den_expr)}]",
+                               "s": "Combine everything into a single fraction."})
 
-    result = sp.simplify(expr)
-    result = sp.nsimplify(result)
-    re_part = sp.nsimplify(sp.re(result))
-    im_part = sp.nsimplify(sp.im(result))
-    steps.append({"d": "Using i² = -1, simplify",
-                   "s": "Remember that i squared equals negative one, and simplify."})
+    # Explicit "i^2 = -1" step, only shown if it actually changes anything
+    num_sub = sp.expand(num_expr.subs(I**2, -1))
+    den_sub = sp.expand(den_expr.subs(I**2, -1)) if den_expr != 1 else den_expr
+    if num_sub != num_expr or den_sub != den_expr:
+        if den_expr != 1:
+            steps.append({"d": f"Using i² = -1:  [{pretty(num_sub)}] / [{pretty(den_sub)}]",
+                           "s": "Replace i squared with negative one, and simplify."})
+        else:
+            steps.append({"d": f"Using i² = -1:  {pretty(num_sub)}",
+                           "s": "Replace i squared with negative one, and simplify."})
+
+    result = sp.expand(num_sub / den_sub) if den_sub != 1 else num_sub
+    poly = sp.Poly(result, I) if result.has(I) else None
+    if poly and poly.degree() >= 1:
+        coeffs = poly.all_coeffs()
+        im_part = sp.nsimplify(coeffs[0]) if poly.degree() == 1 else 0
+        re_part = sp.nsimplify(coeffs[-1])
+    else:
+        re_part, im_part = sp.nsimplify(result), sp.Integer(0)
+
     if im_part == 0:
-        steps.append({"d": f"= {fmt(re_part)}", "s": f"That simplifies to {fmt(re_part)}."})
+        steps.append({"d": f"= {fmt(re_part)} + 0i", "s": f"That simplifies to {fmt(re_part)}."})
         steps.append({"d": f"∴  a = {fmt(re_part)}  and  b = 0",
                        "s": f"So in the form a plus b i, a is {fmt(re_part)} and b is 0."})
     else:
-        im_str = f"{fmt(im_part)}i" if im_part != 1 else "i"
-        if im_part == -1:
-            im_str = "i"
         sign = "+" if im_part >= 0 else "-"
         steps.append({"d": f"= {fmt(re_part)} {sign} {fmt(abs(im_part))}i",
                        "s": f"That simplifies to {fmt(re_part)} {'plus' if im_part>=0 else 'minus'} {fmt(abs(im_part))} i."})
