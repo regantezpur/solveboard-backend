@@ -66,10 +66,97 @@ FUNC_POWER_BARE_RE = re.compile(rf"(?<![a-zA-Z])({FUNC_NAMES})\^(\d+)({ARG})\b(?
 BARE_FUNC_RE = re.compile(rf"(?<![a-zA-Z])({FUNC_NAMES})(?!\()({ARG})\b", re.IGNORECASE)
 
 
+def find_matching_brace(text, open_idx):
+    depth = 0
+    for i in range(open_idx, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+BACKSLASH = "\\"  # built once, named, to keep every reference to it unambiguous
+
+
+def latex_to_plain(text: str) -> str:
+    """Convert common LaTeX math commands into our plain-text syntax, so a problem
+    pasted or OCR'd from a textbook/PDF (which often comes out as LaTeX) still
+    parses. Not a full LaTeX engine — covers the constructs K-12 problems actually
+    use: \\frac, \\sqrt, \\left/\\right, \\cdot, \\pi, trig names, and ^{...}."""
+    b = BACKSLASH
+    if b not in text:
+        return text  # fast path — nothing to do for ordinary input
+
+    changed = True
+    while changed:
+        changed = False
+        idx = text.find(b + "frac{")
+        if idx != -1:
+            open1 = idx + 5  # position of the '{' itself (\frac + { = 5 chars in)
+            close1 = find_matching_brace(text, open1)
+            if close1 != -1 and close1 + 1 < len(text) and text[close1 + 1] == "{":
+                open2 = close1 + 1
+                close2 = find_matching_brace(text, open2)
+                if close2 != -1:
+                    num, den = text[open1 + 1:close1], text[open2 + 1:close2]
+                    text = text[:idx] + f"(({num})/({den}))" + text[close2 + 1:]
+                    changed = True
+                    continue
+        idx2 = text.find(b + "sqrt{")
+        if idx2 != -1:
+            open3 = idx2 + 5
+            close3 = find_matching_brace(text, open3)
+            if close3 != -1:
+                inner = text[open3 + 1:close3]
+                text = text[:idx2] + f"sqrt({inner})" + text[close3 + 1:]
+                changed = True
+                continue
+
+    text = text.replace(b + "left(", "(").replace(b + "right)", ")")
+    text = text.replace(b + "left|", "|").replace(b + "right|", "|")
+    text = text.replace(b + "left[", "[").replace(b + "right]", "]")
+    text = text.replace(b + "cdot", "*").replace(b + "times", "*")
+    text = text.replace(b + "pi", "pi")
+    for fn in ("sin", "cos", "tan", "sec", "csc", "cot", "log", "ln"):
+        text = text.replace(b + fn, fn)
+    text = text.replace(b + ",", " ").replace(b + ";", " ").replace(b + "!", " ")
+    text = text.replace(b + "quad", " ").replace(b + "qquad", " ")
+
+    # ^{n} -> ^(n)
+    out, i = [], 0
+    while i < len(text):
+        if text[i] == "^" and i + 1 < len(text) and text[i + 1] == "{":
+            close = find_matching_brace(text, i + 1)
+            if close != -1:
+                out.append(f"^({text[i+2:close]})")
+                i = close + 1
+                continue
+        out.append(text[i])
+        i += 1
+    text = "".join(out)
+
+    text = text.replace("{", "(").replace("}", ")")
+
+    # strip any remaining backslash-commands we didn't explicitly handle
+    out, i = [], 0
+    while i < len(text):
+        if text[i] == b:
+            i += 1
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
 def normalize(text: str) -> str:
-    """Turn symbols from the on-screen math toolbar into parseable text, and rescue
+    """Turn symbols from the on-screen math toolbar into parseable text, rescue
     function calls a student typed without parentheses (e.g. 'sinx', 'sinpi') before
-    the parser can misread them as separate letters multiplied together."""
+    the parser can misread them as separate letters multiplied together, and convert
+    any LaTeX commands (pasted from a textbook/PDF) into our plain-text syntax."""
+    text = latex_to_plain(text)
     for k, v in SYMBOL_MAP.items():
         text = text.replace(k, v)
     text = FUNC_POWER_PAREN_RE.sub(r"(\1(\3))^\2", text)
@@ -770,6 +857,58 @@ def solve_vector(problem: str):
     return steps
 
 
+DERIV_RE = re.compile(r"\(?\s*d\^?(\d)?\s*y\s*\)?\s*/\s*\(?\s*dx\^?(\d)?\s*\)?", re.IGNORECASE)
+DERIV_NAMES = {1: "dy/dx", 2: "d²y/dx²", 3: "d³y/dx³", 4: "d⁴y/dx⁴"}
+
+
+def solve_ode_order_degree(problem: str):
+    """Classifies (doesn't solve) a differential equation by order and degree —
+    a conceptual identification question, not a computation."""
+    m = re.search(r"differential equation\s*(.*)", problem, re.IGNORECASE)
+    eq_text = (m.group(1) if m else problem).strip().rstrip("?").strip()
+    eq_display = normalize(eq_text).replace("**", "^")  # readable form for the whiteboard
+
+    order_syms = {}
+
+    def repl(mm):
+        order = int(mm.group(1) or mm.group(2) or 1)
+        order_syms.setdefault(order, sp.Symbol(f"D{order}"))
+        return f" {order_syms[order]} "
+
+    subbed = DERIV_RE.sub(repl, normalize(eq_text)).replace("^", "**")
+    if not order_syms:
+        raise HTTPException(400, "Couldn't find any dy/dx-style derivative in that — "
+                                  "try something like 'd^2y/dx^2 + 3(dy/dx)^2 + y = 0'.")
+
+    lhs_text, rhs_text = subbed.split("=") if "=" in subbed else (subbed, "0")
+    local_dict = {str(s): s for s in order_syms.values()}
+    local_dict["y"] = sp.Symbol("y")
+    expr = (parse_expr(lhs_text, local_dict=local_dict, transformations=TRANSFORMS) -
+            parse_expr(rhs_text, local_dict=local_dict, transformations=TRANSFORMS))
+
+    order = max(order_syms.keys())
+    highest_sym = order_syms[order]
+    highest_name = DERIV_NAMES.get(order, f"d^{order}y/dx^{order}")
+
+    steps = [{"d": f"Given: {eq_display}", "s": "Let's find the order and degree of this differential equation."}]
+    steps.append({"d": f"Highest-order derivative present: {highest_name}",
+                   "s": f"The highest derivative in the equation is order {order}."})
+    steps.append({"d": f"∴ Order = {order}", "s": f"So the order of the differential equation is {order}."})
+
+    try:
+        degree = sp.Poly(expr, highest_sym).degree()
+        steps.append({"d": f"The equation is a polynomial in {highest_name} — it appears to the power {degree}",
+                       "s": f"Since the equation is a polynomial in the highest derivative, the degree is the "
+                            f"power it's raised to, which is {degree}."})
+        steps.append({"d": f"∴ Degree = {degree}", "s": f"So the degree is {degree}."})
+    except sp.PolynomialError:
+        steps.append({"d": f"The equation isn't a polynomial in {highest_name} (a radical or fraction is involved) "
+                            f"— clear that first before reading off the degree",
+                       "s": "Since the highest derivative appears under a radical or fraction, the degree "
+                            "isn't directly readable until that's cleared first."})
+    return steps
+
+
 @app.get("/")
 def health():
     return {"status": "ok", "message": "SolveBoard solver is running."}
@@ -783,7 +922,10 @@ def solve(payload: ProblemIn):
 
     low = problem.lower()
     try:
-        if re.search(r"(?<![a-zA-Z])i(?![a-zA-Z])", problem) and re.search(r"\d", problem) and \
+        if ("order" in low and "degree" in low) or DERIV_RE.search(problem):
+            steps = solve_ode_order_degree(problem)
+            topic = "Differential Equations (Order & Degree)"
+        elif re.search(r"(?<![a-zA-Z])i(?![a-zA-Z])", problem) and re.search(r"\d", problem) and \
                 ("/" in problem or "+" in problem or "-" in problem) and "sin" not in low and "cos" not in low:
             steps = solve_complex(problem)
             topic = "Complex Numbers"
