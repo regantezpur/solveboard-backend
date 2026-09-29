@@ -597,8 +597,14 @@ def solve_geometry(problem: str):
 
 
 def extract_calc_expr(problem: str):
-    text = re.sub(r"(?i)differentiate|derivative of|d/dx|integrate|with respect to x|\by\s*=", "", problem)
-    text = text.strip()
+    # LaTeX first (\(...\), \sin, etc.), so phrase-stripping below sees clean text,
+    # not backslashes.
+    text = latex_to_plain(problem.replace("$", ""))
+    # Generic question phrasing: "Find/What is/Calculate/Determine/Compute (the) ... of"
+    text = re.sub(r"(?i)^\s*(find|what\s+is|calculate|determine|compute|evaluate)\s+(the\s+)?"
+                  r"(derivative|integral|slope|gradient)?\s*(of)?\s*", "", text)
+    text = re.sub(r"(?i)differentiate|derivative of|d/dx|integrate|with respect to x|\by\s*=", "", text)
+    text = text.strip().rstrip(".?!").strip()
 
     if "=" in text:
         left, _, right = text.partition("=")
@@ -1264,7 +1270,7 @@ def solve(payload: ProblemIn):
         elif re.search(r"(?i)differentiate|derivative|d/dx", problem):
             steps = solve_derivative(problem)
             topic = "Calculus (Differentiation)"
-        elif re.search(r"(?i)integrate|∫", problem):
+        elif re.search(r"(?i)integrate|integral|∫", problem):
             steps = solve_integral(problem)
             topic = "Calculus (Integration)"
         elif "=" in problem:
