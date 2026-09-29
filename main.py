@@ -162,6 +162,9 @@ def normalize(text: str) -> str:
     text = FUNC_POWER_PAREN_RE.sub(r"(\1(\3))^\2", text)
     text = FUNC_POWER_BARE_RE.sub(r"(\1(\3))^\2", text)
     text = BARE_FUNC_RE.sub(r"\1(\2)", text)
+    # A '.' directly before a letter or '(' is multiplication (how a "·" often survives
+    # copy-paste). Decimals (3.5) and sentence-ending periods never match this.
+    text = re.sub(r"\.(?=[A-Za-z(])", "*", text)
     return text
 
 
@@ -230,6 +233,7 @@ def pretty(expr):
     s = re.sub(r"(\d)\*([a-zA-Z])", r"\1\2", s)   # 54*x -> 54x
     s = re.sub(r"\b1([a-zA-Z])\b", r"\1", s)      # 1x -> x
     s = s.replace("**2", "²").replace("**3", "³").replace("**", "^")
+    s = s.replace("*", "·")   # any remaining multiplication reads as a dot, not a stray asterisk
     s = sqrtify(s)
     return s
 
@@ -247,7 +251,7 @@ def fmt(n):
 def term_str(coeff, var="", first=False):
     """Format one polynomial term with correct sign and no '1x'/'​-1x' clutter."""
     coeff = sp.nsimplify(coeff)
-    sign = "" if (first and coeff >= 0) else ("+ " if coeff >= 0 else "- ")
+    sign = "" if (first and coeff >= 0) else ("-" if first else ("+ " if coeff >= 0 else "- "))
     mag = abs(coeff)
     if var and mag == 1:
         body = var
@@ -443,6 +447,18 @@ def _arithmetic_steps(expr):
 def solve_arithmetic(problem: str):
     raw = problem.strip()
     expr = parse_side(raw, degrees=True)
+    if expr.free_symbols:
+        # Something in there isn't a number — usually ordinary words (which the parser
+        # would happily read as letters multiplied together) or an unknown like x with no
+        # equation. Presenting that as an "answer" would be confident nonsense.
+        letters = ", ".join(sorted(str(s) for s in expr.free_symbols))
+        raise HTTPException(
+            400,
+            f"I couldn't turn that into a calculation — it contains {letters}, which I can't "
+            f"evaluate as numbers. If it's an equation, include an '=' (e.g. '2x + 5 = 17'); "
+            f"if it's a word problem, I currently understand motion problems "
+            f"(position → velocity/acceleration).",
+        )
     # Parse again, unevaluated, so we can walk the original structure step by step —
     # SymPy auto-simplifies plain numeric expressions the instant they're built otherwise.
     unevaluated = parse_expr(
@@ -582,10 +598,38 @@ def solve_geometry(problem: str):
 
 def extract_calc_expr(problem: str):
     text = re.sub(r"(?i)differentiate|derivative of|d/dx|integrate|with respect to x|\by\s*=", "", problem)
-    text = strip_outer_parens(text.strip())
+    text = text.strip()
+
+    if "=" in text:
+        left, _, right = text.partition("=")
+        # "f(x) = x^2 + 1" or "g = ..." -> keep only the right-hand side
+        if re.fullmatch(r"\s*[a-zA-Z]\s*(\(\s*x\s*\))?\s*", left) and "=" not in right:
+            text = right.strip()
+        else:
+            # A stray '=' in the middle of an expression is almost always a typo: '=' and '+'
+            # share a key on most keyboards, so "x=2" is usually "x+2" without Shift.
+            # Don't silently "fix" it — that could answer a different question than the
+            # student asked. Say what we noticed instead.
+            eq = text.index("=")
+            lo, hi = text.rfind("(", 0, eq), text.find(")", eq)
+            ctx = text[lo:hi + 1] if lo != -1 and hi != -1 else text[max(0, eq - 4): eq + 5]
+            as_plus, as_minus = ctx.replace("=", "+"), ctx.replace("=", "-")
+            raise HTTPException(
+                400,
+                f"I found an '=' inside the expression, in \"{ctx}\". Did you mean "
+                f"\"{as_plus}\" or \"{as_minus}\"? (On many keyboards '=' and '+' share a key.) "
+                f"Please correct it and try again.",
+            )
+    text = strip_outer_parens(text)
     # Calculus is done symbolically in x, in radians (the standard convention) —
     # degree-conversion is only for evaluating a specific numeric angle.
     return parse_side(text, degrees=False)
+
+
+def paren(e):
+    """Wrap a sum in parentheses when it's used as a factor, so 'x + 2' times sin(x)
+    is written (x + 2)·sin(x) — never x + 2·sin(x), which means something else."""
+    return f"({pretty(e)})" if isinstance(e, sp.Add) else pretty(e)
 
 
 TRIG_DERIVS = {
@@ -611,13 +655,37 @@ def diff_with_steps(expr, steps, top=True):
         const_factors = [a for a in expr.args if not a.has(X)]
         var_parts = [a for a in expr.args if a.has(X)]
         const_part = sp.Mul(*const_factors) if const_factors else sp.Integer(1)
+
+        # A genuine quotient (denominator involves x in a non-monomial way, e.g. x+3):
+        # use the quotient rule, the way it's taught, instead of treating 1/(x+3) as a
+        # power-rule factor inside a product.
+        num, den = sp.fraction(sp.Mul(*var_parts)) if var_parts else (sp.Integer(1), sp.Integer(1))
+        den_is_monomial = den == X or (isinstance(den, sp.Pow) and den.args[0] == X)
+        if den.has(X) and not den_is_monomial:
+            steps.append({"d": f"Quotient rule:  d/dx(N/D) = (D·d/dx(N) - N·d/dx(D)) / D²,   "
+                                f"where N = {pretty(num)}  and  D = {pretty(den)}",
+                           "s": "Since this is a fraction with x in the denominator, use the quotient rule: "
+                                "the denominator times the derivative of the numerator, minus the numerator "
+                                "times the derivative of the denominator, all over the denominator squared."})
+            dn = diff_with_steps(num, steps, top=False)
+            if num.has(X) and num != X:
+                steps.append({"d": f"d/dx({pretty(num)}) = {pretty(dn)}",
+                               "s": f"The derivative of the numerator is {pretty(dn)}."})
+            dd = diff_with_steps(den, steps, top=False)
+            if den != X:
+                steps.append({"d": f"d/dx({pretty(den)}) = {pretty(dd)}",
+                               "s": f"The derivative of the denominator is {pretty(dd)}."})
+            steps.append({"d": f"= (({pretty(den)})({pretty(dn)}) - ({pretty(num)})({pretty(dd)})) / ({pretty(den)})²",
+                           "s": "Substitute these into the quotient rule."})
+            return const_part * sp.simplify((den * dn - num * dd) / den ** 2)
+
         if len(var_parts) <= 1:
             u = var_parts[0] if var_parts else sp.Integer(1)
             return const_part * diff_with_steps(u, steps, top=False)
         # product rule across all variable factors, applied pairwise
         u = var_parts[0]
         v = sp.Mul(*var_parts[1:])
-        steps.append({"d": f"Product rule:  d/dx({pretty(u)}·{pretty(v)}) = {pretty(u)}·d/dx({pretty(v)}) + {pretty(v)}·d/dx({pretty(u)})",
+        steps.append({"d": f"Product rule:  d/dx({paren(u)}·{paren(v)}) = {paren(u)}·d/dx({pretty(v)}) + {paren(v)}·d/dx({pretty(u)})",
                        "s": "Since this is a product of two expressions involving x, use the product rule."})
         du = diff_with_steps(u, steps, top=False)
         dv = diff_with_steps(v, steps, top=False)
@@ -648,9 +716,13 @@ def diff_with_steps(expr, steps, top=True):
     if expr.func in TRIG_DERIVS:
         inner = expr.args[0]
         outer_deriv = TRIG_DERIVS[expr.func](inner)
-        steps.append({"d": f"d/dx({expr.func.__name__}({pretty(inner)})) = {pretty(outer_deriv)} · d/dx({pretty(inner)})",
-                       "s": f"Use the chain rule for {expr.func.__name__}: differentiate the outside, "
-                            f"then multiply by the derivative of the inside."})
+        if inner == X:
+            steps.append({"d": f"d/dx({expr.func.__name__}(x)) = {pretty(outer_deriv)}",
+                           "s": f"The derivative of {expr.func.__name__} x is {pretty(outer_deriv)}."})
+        else:
+            steps.append({"d": f"d/dx({expr.func.__name__}({pretty(inner)})) = {pretty(outer_deriv)} · d/dx({pretty(inner)})",
+                           "s": f"Use the chain rule for {expr.func.__name__}: differentiate the outside, "
+                                f"then multiply by the derivative of the inside."})
         inner_deriv = diff_with_steps(inner, steps, top=False)
         if inner != X:
             steps.append({"d": f"d/dx({pretty(inner)}) = {pretty(inner_deriv)}",
@@ -661,8 +733,11 @@ def diff_with_steps(expr, steps, top=True):
 
 
 def solve_derivative(problem: str):
-    expr = sp.expand(extract_calc_expr(problem))
-    is_simple = expr.is_polynomial(X)
+    parsed = extract_calc_expr(problem)
+    is_simple = sp.expand(parsed).is_polynomial(X)
+    # Only expand polynomials (to split them term by term). Expanding anything else
+    # destroys the structure the student wrote and produces confusing, repeated steps.
+    expr = sp.expand(parsed) if is_simple else parsed
     terms = sp.Add.make_args(expr) if is_simple else [expr]
 
     steps = [{"d": f"Differentiate: {pretty(expr)}",
@@ -691,27 +766,98 @@ def solve_integral(problem: str):
     return steps
 
 
+I_NAMES = {0: "", 1: "i", 2: "i²", 3: "i³"}
+
+
+def ci_str(expr, I, sub_i2: bool = False) -> str:
+    """Write an expression in i the way a textbook does: ascending powers, no stray
+    asterisks — '3 + 10i + 8i²', not '8*i**2 + 10*i + 3'. With sub_i2=True, i² is
+    shown already replaced by (-1), e.g. '12 + 20(-1)', as the PDF's worked solutions do."""
+    expr = sp.expand(expr)
+    if not expr.has(I):
+        return fmt(expr)
+    coeffs = sp.Poly(expr, I).all_coeffs()[::-1]
+    parts = []
+    for power, c in enumerate(coeffs):
+        if c == 0:
+            continue
+        var = "(-1)" if (sub_i2 and power == 2) else I_NAMES.get(power, f"i^{power}")
+        parts.append(term_str(c, var, first=(not parts)))
+    return " ".join(parts) if parts else "0"
+
+
+def reduce_i(expr, I):
+    """Reduce every power of i using i² = -1 (so i³ = -i, i⁴ = 1 as well) — done as a
+    polynomial remainder modulo i²+1, which is exact for any power."""
+    expr = sp.expand(expr)
+    if not expr.has(I):
+        return expr
+    return sp.rem(sp.Poly(expr, I), sp.Poly(I ** 2 + 1, I)).as_expr()
+
+
+def mono_str(term, I, first: bool) -> str:
+    """One un-collected product term such as 10i² or -4i, as it appears mid-expansion."""
+    k = int(sp.degree(term, I)) if term.has(I) else 0
+    c = sp.nsimplify(sp.simplify(term / I ** k))
+    return term_str(c, I_NAMES.get(k, f"i^{k}"), first)
+
+
+def extract_math_run(text: str) -> str:
+    """Pull the mathematical expression out of a sentence — the longest run made only of
+    digits, i, operators, brackets and spaces — so 'Simplify (3+4i)/(1-2i) where i is the
+    imaginary unit' works instead of failing on the words."""
+    runs = re.findall(r"[0-9i+\-*/().^\s]+", text)
+    runs = [r.strip() for r in runs if re.search(r"\d", r) and re.search(r"[+\-*/()]", r)]
+    if not runs:
+        raise HTTPException(400, "I couldn't find a calculation in that. Try something like "
+                                  "'(3+2i)/(2-5i) + (3-2i)/(2+5i)'.")
+    return max(runs, key=len)
+
+
 def solve_complex(problem: str):
-    text = normalize(problem).replace("^", "**").lower()
+    if re.search(r"[α-ωΑ-Ω]", problem):
+        raise HTTPException(400, "This has unknowns written as Greek letters (like λ and μ). Solving for "
+                                  "unknowns inside complex equations isn't supported yet — I can simplify "
+                                  "complex expressions with numbers, like '(3+7i)(2+i)'.")
+    wants_modulus = any(w in problem.lower() for w in ("modulus", "magnitude", "absolute value"))
+    math_text = extract_math_run(normalize(problem).lower())
+    text = math_text.replace("^", "**")
     I = sp.Symbol("i")  # a PLAIN symbol, not sp.I — this is what lets us control exactly
     # when i**2 becomes -1, instead of the math library doing it automatically and
     # collapsing several teaching steps into one.
     expr = parse_expr(text, transformations=TRANSFORMS, local_dict={"i": I})
+    stray = expr.free_symbols - {I}
+    if stray:
+        raise HTTPException(400, f"I found {', '.join(sorted(map(str, stray)))} in that, which I can't "
+                                  f"treat as a number. (Solving for unknowns like λ and μ in complex "
+                                  f"equations isn't supported yet.)")
 
-    steps = [{"d": f"{problem.strip()}", "s": f"Let's simplify this, where i is the imaginary unit."}]
+    steps = [{"d": math_text, "s": "Let's simplify this, where i is the imaginary unit."}]
 
     add_args = sp.Add.make_args(expr)
     num_expr, den_expr = None, None
 
     if len(add_args) == 2 and all(sp.fraction(a)[1] != 1 for a in add_args):
-        # Exactly two fractions being added — do the textbook cross-multiplication method
+        # Exactly two fractions being added — the textbook cross-multiplication method,
+        # shown line by line as in a worked solution.
         (numA, denB), (numC, denD) = (sp.fraction(a) for a in add_args)
-        steps.append({"d": f"Combine using conjugates:  [({pretty(numA)})({pretty(denD)}) + ({pretty(denB)})({pretty(numC)})] / [({pretty(denB)})({pretty(denD)})]",
+        steps.append({"d": f"Combine using conjugates:  (({ci_str(numA, I)})({ci_str(denD, I)}) + ({ci_str(denB, I)})({ci_str(numC, I)})) / (({ci_str(denB, I)})({ci_str(denD, I)}))",
                        "s": "Combine into a single fraction by cross-multiplying."})
         num_expr = sp.expand(numA * denD + denB * numC)
         den_expr = sp.expand(denB * denD)
-        steps.append({"d": f"Expand:  [{pretty(num_expr)}] / [{pretty(den_expr)}]",
-                       "s": "Expand each product."})
+
+        # distribute term by term, WITHOUT collecting like terms yet (6+15i+4i+10i²+...)
+        raw_terms = []
+        for A, B in ((numA, denD), (denB, numC)):
+            for ta in sp.Add.make_args(sp.expand(A)):
+                for tb in sp.Add.make_args(sp.expand(B)):
+                    raw_terms.append(sp.expand(ta * tb))
+        raw_num = " ".join(mono_str(t, I, first=(n == 0)) for n, t in enumerate(raw_terms))
+        steps.append({"d": f"Expand each product:  ({raw_num}) / ({ci_str(den_expr, I)})",
+                       "s": "Multiply out each pair of brackets, term by term."})
+        if raw_num != ci_str(num_expr, I):
+            steps.append({"d": f"Collect like terms:  ({ci_str(num_expr, I)}) / ({ci_str(den_expr, I)})",
+                           "s": "Now combine the like terms."})
     else:
         combined = sp.together(expr)
         num_expr, den_expr = sp.fraction(combined)
@@ -719,28 +865,48 @@ def solve_complex(problem: str):
             # Rationalize: multiply top and bottom by the denominator's conjugate.
             # (Substituting i -> -i gives the conjugate for anything linear in i.)
             den_conj = den_expr.subs(I, -I)
-            steps.append({"d": f"Multiply numerator and denominator by the conjugate:  ({den_conj})/({den_conj})",
+            steps.append({"d": f"Multiply numerator and denominator by the conjugate:  ({ci_str(den_conj, I)})/({ci_str(den_conj, I)})",
                            "s": "Multiply both the numerator and denominator by the denominator's conjugate, to clear i from the denominator."})
             num_expr = sp.expand(num_expr * den_conj)
             den_expr = sp.expand(den_expr * den_conj)
-            steps.append({"d": f"= [{pretty(num_expr)}] / [{pretty(den_expr)}]",
+            steps.append({"d": f"= ({ci_str(num_expr, I)}) / ({ci_str(den_expr, I)})",
                            "s": "Expand the numerator and denominator."})
         else:
             num_expr, den_expr = sp.expand(num_expr), sp.expand(den_expr)
             if den_expr != 1:
-                steps.append({"d": f"Combine into a single fraction:  [{pretty(num_expr)}] / [{pretty(den_expr)}]",
+                steps.append({"d": f"Combine into a single fraction:  ({ci_str(num_expr, I)}) / ({ci_str(den_expr, I)})",
                                "s": "Combine everything into a single fraction."})
 
-    # Explicit "i^2 = -1" step, only shown if it actually changes anything
-    num_sub = sp.expand(num_expr.subs(I**2, -1))
-    den_sub = sp.expand(den_expr.subs(I**2, -1)) if den_expr != 1 else den_expr
+    # Explicit "i² = -1" step, shown the way the PDF does: 12 + 20(-1)  /  4 - 25(-1)
+    num_sub = reduce_i(num_expr, I)
+    den_sub = reduce_i(den_expr, I) if den_expr != 1 else den_expr
     if num_sub != num_expr or den_sub != den_expr:
         if den_expr != 1:
-            steps.append({"d": f"Using i² = -1:  [{pretty(num_sub)}] / [{pretty(den_sub)}]",
-                           "s": "Replace i squared with negative one, and simplify."})
+            steps.append({"d": f"Using i² = -1:  ({ci_str(num_expr, I, sub_i2=True)}) / ({ci_str(den_expr, I, sub_i2=True)})",
+                           "s": "Replace i squared with negative one."})
+            if num_sub.has(I) or den_sub.has(I):
+                steps.append({"d": f"Simplify:  ({ci_str(num_sub, I)}) / ({ci_str(den_sub, I)})",
+                               "s": "Simplify the numerator and the denominator."})
         else:
-            steps.append({"d": f"Using i² = -1:  {pretty(num_sub)}",
-                           "s": "Replace i squared with negative one, and simplify."})
+            steps.append({"d": f"Using i² = -1:  {ci_str(num_expr, I, sub_i2=True)}",
+                           "s": "Replace i squared with negative one."})
+
+    # If the denominator STILL contains i (it only comes out real when the two denominators
+    # happen to be conjugates, as in the PDF's example), rationalize it too — exactly what a
+    # student would do next.
+    if den_sub != 1 and den_sub.has(I):
+        conj = den_sub.subs(I, -I)
+        steps.append({"d": f"The denominator still has i — multiply top and bottom by its conjugate:  ({ci_str(conj, I)})/({ci_str(conj, I)})",
+                       "s": "The denominator still contains i, so multiply the numerator and denominator by its conjugate."})
+        n2, d2 = sp.expand(num_sub * conj), sp.expand(den_sub * conj)
+        steps.append({"d": f"= ({ci_str(n2, I)}) / ({ci_str(d2, I)})", "s": "Expand the numerator and denominator."})
+        n3, d3 = reduce_i(n2, I), reduce_i(d2, I)
+        steps.append({"d": f"Using i² = -1:  ({ci_str(n2, I, sub_i2=True)}) / ({ci_str(d2, I, sub_i2=True)})",
+                       "s": "Replace i squared with negative one."})
+        steps.append({"d": f"Simplify:  ({ci_str(n3, I)}) / ({ci_str(d3, I)})", "s": "Simplify."})
+        num_sub, den_sub = n3, d3
+    if den_sub.has(I):
+        raise HTTPException(400, "I couldn't clear i from the denominator for that expression.")
 
     result = sp.expand(num_sub / den_sub) if den_sub != 1 else num_sub
     poly = sp.Poly(result, I) if result.has(I) else None
@@ -756,11 +922,16 @@ def solve_complex(problem: str):
         steps.append({"d": f"∴  a = {fmt(re_part)}  and  b = 0",
                        "s": f"So in the form a plus b i, a is {fmt(re_part)} and b is 0."})
     else:
-        sign = "+" if im_part >= 0 else "-"
-        steps.append({"d": f"= {fmt(re_part)} {sign} {fmt(abs(im_part))}i",
+        steps.append({"d": f"= {ci_str(re_part + im_part * I, I)}",
                        "s": f"That simplifies to {fmt(re_part)} {'plus' if im_part>=0 else 'minus'} {fmt(abs(im_part))} i."})
         steps.append({"d": f"∴  a = {fmt(re_part)}  and  b = {fmt(im_part)}",
                        "s": f"So a is {fmt(re_part)} and b is {fmt(im_part)}."})
+
+    if wants_modulus:
+        mod = sp.simplify(sp.sqrt(re_part ** 2 + im_part ** 2))
+        mod_str = fmt(mod) if mod.is_Rational else pretty(mod)
+        steps.append({"d": f"|z| = √(a² + b²) = √(({fmt(re_part)})² + ({fmt(im_part)})²) = {mod_str}",
+                       "s": f"The modulus is the square root of a squared plus b squared, which is {mod_str}."})
     return steps
 
 
@@ -810,6 +981,19 @@ def vector_str(ci, cj, ck, denom_display=None):
     return body
 
 
+def is_vector_problem(problem: str) -> bool:
+    """A vector (i, j, k) problem — not a complex number that merely contains an 'i'.
+    Vectors use j or k alongside i; complex numbers use only i. The word "unit" alone is
+    NOT enough ("i is the imaginary unit"), and neither is "magnitude" (complex modulus)
+    unless a j or k is present."""
+    low = problem.lower()
+    has_jk = re.search(r"(?<![a-zA-Z])[jk](?![a-zA-Z])", problem)
+    has_i = re.search(r"(?<![a-zA-Z])i(?![a-zA-Z])", problem)
+    if has_jk and any(w in low for w in ("vector", "magnitude", "direction", "unit")):
+        return True
+    return bool("vector" in low and (has_i or has_jk))
+
+
 def solve_vector(problem: str):
     low = problem.lower()
     vec_text = problem[low.rfind(" of ") + 4:] if " of " in low else problem
@@ -854,6 +1038,139 @@ def solve_vector(problem: str):
             else:
                 disp_terms.append(f"+ {frag}" if coeff >= 0 else f"- {frag.lstrip('-')}")
         steps.append({"d": f"= {' '.join(disp_terms)}", "s": "That's the final vector, in exact form."})
+    return steps
+
+
+EVAL_POINT_RE = re.compile(r"(?:at|when|for|if)\s*\(?\s*([a-zA-Z])\s*=\s*(-?\d+(?:\.\d+)?)", re.IGNORECASE)
+EVAL_SECONDS_RE = re.compile(r"(?:at|after|when)\s+(?:time\s+)?(-?\d+(?:\.\d+)?)\s*(?:s\b|sec)", re.IGNORECASE)
+FUNC_WORDS = {"sin", "cos", "tan", "sec", "csc", "cot", "sqrt", "log", "ln", "exp", "pi", "abs"}
+
+
+def swap_var(text: str, old: str, new: str) -> str:
+    """Replace a single-letter variable only where it stands alone as a variable —
+    never inside a longer name like sqrt, tan, or exp (a plain str.replace would
+    turn sqrt(t) into sqrx(x))."""
+    return re.sub(rf"(?<![A-Za-z]){re.escape(old)}(?![A-Za-z])", new, text)
+
+
+def grab_expression(text: str, start: int) -> str:
+    """Read a math expression starting at `start`, stopping where the math ends and the
+    sentence carries on: at a sentence-ending period, a comma, an unmatched ')', or the
+    first ordinary word (meters, where, with, find ...). This is what stops
+    '... + 9t. Find its acceleration ...' from swallowing the next sentence."""
+    depth, i, n = 0, start, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in ",;?!$":
+            break
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        elif ch == "." and not (i + 1 < n and text[i + 1].isdigit()):
+            break
+        elif ch.isalpha():
+            j = i
+            while j < n and text[j].isalpha():
+                j += 1
+            if j - i >= 2 and text[i:j].lower() not in FUNC_WORDS:
+                break
+            i = j
+            continue
+        i += 1
+    return text[start:i].strip()
+
+
+def find_motion_definition(text: str):
+    """Locate 'x(t) = ...' or plain 'x = ...' and return (function name, variable, expression)."""
+    m = re.search(r"(?<![A-Za-z])([A-Za-z])\(([A-Za-z])\)\s*=\s*", text)
+    if m:
+        expr = grab_expression(text, m.end())
+        return (m.group(1), m.group(2), expr) if expr else None
+
+    em = EVAL_POINT_RE.search(text)
+    eval_var = em.group(1) if em else None
+    for m in re.finditer(r"(?<![A-Za-z])([A-Za-z])\s*=\s*", text):
+        name = m.group(1)
+        if eval_var and name == eval_var:
+            continue                      # that's "t = 2" (the point), not the position function
+        expr = grab_expression(text, m.end())
+        letters = {w for w in re.findall(r"[A-Za-z]+", expr) if w.lower() not in FUNC_WORDS}
+        if not letters:
+            continue                      # "t = 4": no variable in it, so not a function
+        var = eval_var or (next(iter(letters)) if len(letters) == 1 else None)
+        if var:
+            return name, var, expr
+    return None
+
+
+def solve_motion(problem: str):
+    """Word-problem handler for 'position function -> velocity / acceleration / speed'
+    questions. The variable is often 't' (or another letter), never hardcoded 'x', so this
+    swaps the problem's own variable for our internal x, computes, then swaps back for
+    display. Returns None if this doesn't look like a motion problem, so the caller can
+    fall through to something else."""
+    text = problem.replace(BACKSLASH + "(", "(").replace(BACKSLASH + ")", ")").replace("$", "")
+    low = text.lower()
+    if not any(w in low for w in ("velocity", "acceleration", "speed")):
+        return None
+    found = find_motion_definition(text)
+    if not found:
+        return None
+    func_name, var_name, expr_text = found
+
+    is_accel = "acceleration" in low
+    is_speed = "speed" in low and "velocity" not in low and not is_accel
+    order = 2 if is_accel else 1
+    quantity = "acceleration" if is_accel else ("speed" if is_speed else "velocity")
+    has_units = "meter" in low and "second" in low
+    unit = ("m/s" if order == 1 else "m/s²") if has_units else ""
+    unit_suffix = f" {unit}" if unit else ""
+    unit_words = (" meters per second" if unit == "m/s" else " meters per second squared") if unit else ""
+
+    expr_x = parse_side(swap_var(expr_text, var_name, "x"), degrees=False)
+    if expr_x.free_symbols - {X}:
+        return None                       # something in there isn't the variable — not ours to guess
+    vel_x = sp.expand(sp.diff(expr_x, X, 1))
+    deriv_x = sp.expand(sp.diff(expr_x, X, order))
+
+    def to_display(e):
+        return swap_var(pretty(e), "x", var_name)
+
+    steps = [{"d": f"Given: {func_name}({var_name}) = {expr_text.strip()}",
+               "s": f"We're given the position function, {func_name} of {var_name}, equals {expr_text.strip()}."}]
+
+    if order == 1:
+        label = "Velocity" if not is_speed else "Velocity"
+        steps.append({"d": f"{label} = d{func_name}/d{var_name} = {to_display(vel_x)}",
+                       "s": f"Velocity is the derivative of position with respect to time, which is {to_display(vel_x)}."})
+    else:
+        steps.append({"d": f"Velocity = d{func_name}/d{var_name} = {to_display(vel_x)}",
+                       "s": "First find velocity, the derivative of position."})
+        steps.append({"d": f"Acceleration = d²{func_name}/d{var_name}² = {to_display(deriv_x)}",
+                       "s": f"Acceleration is the derivative of velocity, which is {to_display(deriv_x)}."})
+
+    em = EVAL_POINT_RE.search(text)
+    sm = EVAL_SECONDS_RE.search(text)
+    point_raw = em.group(2) if em else (sm.group(1) if sm else None)
+    if point_raw is not None:
+        point = sp.nsimplify(point_raw)
+        value = sp.nsimplify(deriv_x.subs(X, point))
+        substituted = swap_var(pretty(deriv_x), "x", f"({fmt(point)})")
+        substituted = re.sub(r"\(\((-?[\d.]+)\)\)", r"(\1)", substituted)   # '√((4))' -> '√(4)'
+        steps.append({"d": f"At {var_name} = {fmt(point)}:  {substituted}",
+                       "s": f"Now substitute {var_name} equals {fmt(point)} into the "
+                            f"{'velocity' if is_speed else quantity} expression."})
+        if is_speed:
+            steps.append({"d": f"Velocity = {fmt(value)}{unit_suffix}", "s": f"That gives a velocity of {fmt(value)}."})
+            speed_val = abs(value)
+            steps.append({"d": f"Speed = |velocity| = |{fmt(value)}| = {fmt(speed_val)}{unit_suffix}",
+                           "s": f"Speed is the size of the velocity, ignoring direction, which is {fmt(speed_val)}{unit_words}."})
+        else:
+            steps.append({"d": f"= {fmt(value)}{unit_suffix}",
+                           "s": f"So the {quantity} at {var_name} equals {fmt(point)} is {fmt(value)}{unit_words}."})
     return steps
 
 
@@ -922,17 +1239,21 @@ def solve(payload: ProblemIn):
 
     low = problem.lower()
     try:
-        if ("order" in low and "degree" in low) or DERIV_RE.search(problem):
+        if any(w in low for w in ("velocity", "acceleration", "speed")) and (motion_steps := solve_motion(problem)):
+            steps = motion_steps
+            topic = "Applied Calculus (Motion)"
+        elif ("order" in low and "degree" in low) or DERIV_RE.search(problem):
             steps = solve_ode_order_degree(problem)
             topic = "Differential Equations (Order & Degree)"
+        elif is_vector_problem(problem):
+            # Checked BEFORE complex numbers: "i - 2j" contains a standalone i, and would
+            # otherwise be grabbed as a complex-number problem.
+            steps = solve_vector(problem)
+            topic = "Vectors"
         elif re.search(r"(?<![a-zA-Z])i(?![a-zA-Z])", problem) and re.search(r"\d", problem) and \
                 ("/" in problem or "+" in problem or "-" in problem) and "sin" not in low and "cos" not in low:
             steps = solve_complex(problem)
             topic = "Complex Numbers"
-        elif re.search(r"(?<![a-zA-Z])[ijk](?![a-zA-Z])", problem) and \
-                any(w in low for w in ["vector", "magnitude", "direction", "unit"]):
-            steps = solve_vector(problem)
-            topic = "Vectors"
         elif "%" in problem:
             steps = solve_percentage(problem)
             topic = "Percentage"
