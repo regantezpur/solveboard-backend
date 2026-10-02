@@ -620,6 +620,10 @@ def extract_calc_expr(problem: str):
                   r"(derivative|integral|slope|gradient)?\s*(of)?\s*", "", text)
     text = re.sub(r"(?i)differentiate|derivative of|d/dx|integrate|with respect to x|\by\s*=", "", text)
     text = text.strip().rstrip(".?!").strip()
+    # Strip a wrapping paren now (often left over from \( ... \) LaTeX delimiters turning
+    # into literal parens around the WHOLE expression) — otherwise "(f(x) = ...)" doesn't
+    # match the "f(x) =" prefix pattern below, since the string doesn't start with a letter.
+    text = strip_outer_parens(text)
 
     if "=" in text:
         left, _, right = text.partition("=")
