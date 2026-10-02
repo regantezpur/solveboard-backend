@@ -239,12 +239,27 @@ def pretty(expr):
 
 
 def fmt(n):
-    """Pretty-print a sympy number: whole numbers without .0, fractions as a/b."""
+    """Pretty-print a sympy number: whole numbers without .0, fractions as a/b,
+    and expressions involving e (like 1/e or 2e) kept exact rather than decimalized —
+    same philosophy as keeping √5 instead of 2.236 everywhere else in this app."""
     n = sp.nsimplify(n)
     if n.is_Integer:
         return str(n)
     if n.is_Rational:
         return f"{n.p}/{n.q}"
+    if n.func == sp.exp:
+        # SymPy auto-canonicalizes E**k back into exp(k) internally — it won't stay
+        # rewritten as a power — so format this Function-call form directly instead.
+        k = n.args[0]
+        if k == 1:
+            return "e"
+        if k == -1:
+            return "1/e"
+        if k.is_negative:
+            return f"1/e^{fmt(-k)}"
+        return f"e^{fmt(k)}"
+    if n.has(sp.E):
+        return pretty(n).replace("E", "e")
     return str(sp.nsimplify(n, rational=False).evalf(4))
 
 
@@ -1184,6 +1199,183 @@ DERIV_RE = re.compile(r"\(?\s*d\^?(\d)?\s*y\s*\)?\s*/\s*\(?\s*dx\^?(\d)?\s*\)?",
 DERIV_NAMES = {1: "dy/dx", 2: "d²y/dx²", 3: "d³y/dx³", 4: "d⁴y/dx⁴"}
 
 
+def try_recover_lost_exponent(text: str, end_of_capture: int, param: str):
+    """'eat' (exponent notation lost in copy/paste) recovered as 'e^(at)' — but ONLY when
+    the capture stopped right after a DANGLING operator (+ - * /). That's a narrow, strong
+    signal something was cut off mid-expression, which is what tells 'eat' (in 't + eat')
+    apart from 'event' appearing as an ordinary word elsewhere — real words essentially
+    never immediately follow a bare trailing operator like that."""
+    stripped = text[:end_of_capture].rstrip()
+    if not stripped or stripped[-1] not in "+-*/":
+        return None
+    m = re.match(r"\s*([a-zA-Z]+)", text[end_of_capture:])
+    if not m:
+        return None
+    word = m.group(1)
+    if len(word) >= 2 and word[0].lower() == "e" and word[-1].lower() == param.lower():
+        return word, end_of_capture + m.end()
+    return None
+
+
+def grab_expression_with_recovery(text: str, start: int, param: str):
+    expr = grab_expression(text, start)
+    end = start + len(text[start:start + len(expr)]) if expr else start
+    # grab_expression doesn't return an end index, so recompute it by re-scanning —
+    # cheap, and keeps that function's signature simple for its other (motion) caller.
+    end = start
+    depth = 0
+    while end < len(text):
+        ch = text[end]
+        if ch in ",;?!$":
+            break
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        elif ch == "." and not (end + 1 < len(text) and text[end + 1].isdigit()):
+            break
+        elif ch.isalpha():
+            j = end
+            while j < len(text) and text[j].isalpha():
+                j += 1
+            word = text[end:j].lower()
+            if word == "and" or (j - end >= 2 and word not in FUNC_WORDS):
+                break
+            end = j
+            continue
+        end += 1
+
+    recovered = try_recover_lost_exponent(text, end, param)
+    if not recovered:
+        return expr, False
+    word, new_end = recovered
+    fixed_word = f"e^({word[1:]})"
+    rest, changed_again = grab_expression_with_recovery(text, new_end, param)
+    full = (expr + " " + fixed_word + (" " + rest if rest else "")).strip()
+    return full, True
+
+
+PARAM_DEF_RE = re.compile(r"([a-zA-Z])\s*(?:\([a-zA-Z]\))?\s*=\s*", re.IGNORECASE)
+
+# Each entry: detection phrase -> (equations to build from X(t), Y(t), a solve target, and
+# a describer for the final answer). Building this as a small table, rather than one-off
+# code per problem, is what lets it grow to cover more conditions later without a rewrite.
+def solve_parametric_curve(problem: str):
+    text = problem.replace(BACKSLASH + "(", "(").replace(BACKSLASH + ")", "").replace("$", "")
+    low = text.lower()
+    if "parametric" not in low:
+        return None
+
+    mx = re.search(r"x\s*(?:\([a-zA-Z]\))?\s*=\s*", text, re.IGNORECASE)
+    my = re.search(r"y\s*(?:\([a-zA-Z]\))?\s*=\s*", text, re.IGNORECASE)
+    if not (mx and my):
+        return None
+    param = "t"  # the overwhelmingly standard convention; problems that use another
+    # letter for the parameter but still call it "t" in prose are rare enough to treat
+    # as a future refinement rather than guess wrong here.
+
+    x_text, x_fixed = grab_expression_with_recovery(text, mx.end(), param)
+    y_text, y_fixed = grab_expression_with_recovery(text, my.end(), param)
+    if not x_text or not y_text:
+        return None
+
+    T = sp.Symbol(param, real=True)
+    extra_letters = sorted(set(re.findall(r"[a-zA-Z]", x_text + y_text)) - {param, "e"})
+    positive_params = {L for L in extra_letters if re.search(rf"\b{L}\s*>\s*0", text, re.IGNORECASE)}
+    # 'e' MUST map to Euler's number, not become a generic symbol — otherwise
+    # d/dt(e^(at)) uses the general power rule for an unknown base and picks up a
+    # spurious log(e) term that never collapses to 1, corrupting the whole solve.
+    local_dict = {param: T, "e": sp.E}
+    for L in extra_letters:
+        local_dict[L] = sp.Symbol(L, positive=(L in positive_params), real=True)
+
+    try:
+        X_t = parse_expr(swap_var(x_text, param, param).replace("^", "**"), local_dict=local_dict, transformations=TRANSFORMS)
+        Y_t = parse_expr(swap_var(y_text, param, param).replace("^", "**"), local_dict=local_dict, transformations=TRANSFORMS)
+    except Exception:
+        return None
+
+    dXdt, dYdt = sp.diff(X_t, T), sp.diff(Y_t, T)
+
+    steps = [{"d": f"Given: x = {x_text}{',  ' + 'note: recovered a lost exponent (e·· → e^(··))' if (x_fixed or y_fixed) else ''}   y = {y_text}",
+               "s": f"We're given the parametric curve, x equals {x_text}, and y equals {y_text}."}]
+    if x_fixed or y_fixed:
+        steps.append({"d": "(The pasted text appeared to be missing an exponent — read 'e··' as e^(··). "
+                            "Please double-check this matches the original question.)",
+                       "s": "I noticed what looked like a missing exponent and filled it in — please double check that's right."})
+
+    conditions, unknowns, describe = None, [T] + [local_dict[L] for L in extra_letters], None
+
+    if re.search(r"touch(?:es)?\s+(?:the\s+)?x[\s-]*axis|tangent\s+to\s+(?:the\s+)?x[\s-]*axis", low):
+        conditions = [sp.Eq(Y_t, 0), sp.Eq(dYdt, 0)]
+        steps.append({"d": "Touching the x-axis means y = 0 AND dy/dt = 0 at the same point "
+                            "(y = 0 alone would only mean crossing it, not touching it)",
+                       "s": "For the curve to touch the x-axis rather than just cross it, we need y equal to zero "
+                            "and the slope, dy by dt, equal to zero, at the same point."})
+        describe = ("x", X_t)
+    elif re.search(r"touch(?:es)?\s+(?:the\s+)?y[\s-]*axis|tangent\s+to\s+(?:the\s+)?y[\s-]*axis", low):
+        conditions = [sp.Eq(X_t, 0), sp.Eq(dXdt, 0)]
+        steps.append({"d": "Touching the y-axis means x = 0 AND dx/dt = 0 at the same point",
+                       "s": "For the curve to touch the y-axis, we need x equal to zero and dx by dt equal to zero, "
+                            "at the same point."})
+        describe = ("y", Y_t)
+    elif "horizontal tangent" in low:
+        conditions = [sp.Eq(dYdt, 0)]
+        steps.append({"d": "A horizontal tangent means dy/dt = 0", "s": "A horizontal tangent means the slope, dy by dt, is zero."})
+        describe = ("point", (X_t, Y_t))
+    elif "vertical tangent" in low:
+        conditions = [sp.Eq(dXdt, 0)]
+        steps.append({"d": "A vertical tangent means dx/dt = 0", "s": "A vertical tangent means dx by dt is zero."})
+        describe = ("point", (X_t, Y_t))
+    else:
+        pm = re.search(r"pass(?:es)?\s+through\s*\(?\s*(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)\s*\)?", low)
+        if pm:
+            p, q = sp.nsimplify(pm.group(1)), sp.nsimplify(pm.group(2))
+            conditions = [sp.Eq(X_t, p), sp.Eq(Y_t, q)]
+            steps.append({"d": f"Passing through ({fmt(p)}, {fmt(q)}) means x = {fmt(p)} and y = {fmt(q)}",
+                           "s": f"Passing through that point means x equals {fmt(p)} and y equals {fmt(q)}, at the same t."})
+            describe = ("confirm", None)
+
+    if conditions is None:
+        raise HTTPException(400, "I found a parametric curve, but not a condition I currently recognize "
+                                  "(I understand: touches the x-axis/y-axis, horizontal/vertical tangent, "
+                                  "or passes through a point). Let me know exactly what's being asked.")
+
+    try:
+        solutions = sp.solve(conditions, unknowns, dict=True)
+    except Exception:
+        solutions = []
+    solutions = [s for s in solutions if all(v.is_real is not False for v in s.values())]
+    if not solutions:
+        steps.append({"d": "No closed-form solution found for this system",
+                       "s": "I wasn't able to find a closed-form solution to this system — this particular "
+                            "curve may need a numerical or more specialized approach."})
+        return steps
+
+    sol = solutions[0]
+    for L in extra_letters:
+        sym = local_dict[L]
+        if sym in sol:
+            steps.append({"d": f"Solving the system gives {L} = {fmt(sol[sym])}",
+                           "s": f"Solving that system, {L} equals {fmt(sol[sym])}."})
+    if T in sol:
+        steps.append({"d": f"…and t = {fmt(sol[T])}", "s": f"And the parameter t equals {fmt(sol[T])} at that point."})
+
+    kind, target = describe
+    if kind == "confirm":
+        steps.append({"d": "So a value of t exists where the curve passes through that point — confirmed above.",
+                       "s": "So a value of t does exist where the curve passes through that point."})
+    elif kind == "point":
+        xv, yv = sp.nsimplify(target[0].subs(sol)), sp.nsimplify(target[1].subs(sol))
+        steps.append({"d": f"∴ Point = ({fmt(xv)}, {fmt(yv)})", "s": f"So the point is {fmt(xv)}, {fmt(yv)}."})
+    else:
+        val = sp.nsimplify(target.subs(sol))
+        steps.append({"d": f"∴ {kind} = {fmt(val)}", "s": f"So {kind} equals {fmt(val)}."})
+    return steps
+
+
 def solve_ode_order_degree(problem: str):
     """Classifies (doesn't solve) a differential equation by order and degree —
     a conceptual identification question, not a computation."""
@@ -1245,7 +1437,10 @@ def solve(payload: ProblemIn):
 
     low = problem.lower()
     try:
-        if any(w in low for w in ("velocity", "acceleration", "speed")) and (motion_steps := solve_motion(problem)):
+        if "parametric" in low and (param_steps := solve_parametric_curve(problem)):
+            steps = param_steps
+            topic = "Parametric Curves"
+        elif any(w in low for w in ("velocity", "acceleration", "speed")) and (motion_steps := solve_motion(problem)):
             steps = motion_steps
             topic = "Applied Calculus (Motion)"
         elif ("order" in low and "degree" in low) or DERIV_RE.search(problem):
